@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
-PyJWT
 requests
-python-multipart
 billboard.py
+PyJWT[crypto]>=2.8.0
+cryptography>=41,<43
+python-multipart
