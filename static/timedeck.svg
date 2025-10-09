@@ -1,0 +1,48 @@
+<!-- TimeDeck Icon — cassette with clock spools -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title desc">
+  <title id="title">TimeDeck Icon</title>
+  <desc id="desc">Rounded cassette with two clock-face spools in neon retro colors</desc>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF3EA5"></stop>
+      <stop offset="1" stop-color="#00D6FF"></stop>
+    </linearGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="rgba(0,0,0,0.25)"></feDropShadow>
+    </filter>
+  </defs>
+
+  <!-- backdrop card -->
+  <rect x="12" y="20" width="168" height="128" rx="18" fill="#fff" stroke="#e7e3f2" stroke-width="3" filter="url(#s)"></rect>
+
+  <!-- cassette top stripe -->
+  <rect x="20" y="36" width="152" height="22" rx="6" fill="url(#g)"></rect>
+
+  <!-- cassette window -->
+  <rect x="36" y="70" width="120" height="40" rx="8" fill="#f9f7ff" stroke="#e7e3f2" stroke-width="2"></rect>
+
+  <!-- left clock spool -->
+  <circle cx="66" cy="90" r="16" fill="#ffffff" stroke="#13121A" stroke-width="2"></circle>
+  <circle cx="66" cy="90" r="14" fill="none" stroke="#FF3EA5" stroke-width="2" stroke-dasharray="2 6"></circle>
+  <!-- hands -->
+  <line x1="66" y1="90" x2="66" y2="78" stroke="#13121A" stroke-width="2" stroke-linecap="round"></line>
+  <line x1="66" y1="90" x2="78" y2="90" stroke="#13121A" stroke-width="2" stroke-linecap="round"></line>
+
+  <!-- right clock spool -->
+  <circle cx="126" cy="90" r="16" fill="#ffffff" stroke="#13121A" stroke-width="2"></circle>
+  <circle cx="126" cy="90" r="14" fill="none" stroke="#00D6FF" stroke-width="2" stroke-dasharray="2 6"></circle>
+  <!-- hands -->
+  <line x1="126" y1="90" x2="126" y2="80" stroke="#13121A" stroke-width="2" stroke-linecap="round"></line>
+  <line x1="126" y1="90" x2="118" y2="100" stroke="#13121A" stroke-width="2" stroke-linecap="round"></line>
+
+  <!-- label area -->
+  <rect x="28" y="116" width="136" height="18" rx="6" fill="#ffe94a" opacity="0.9"></rect>
+
+  <!-- bottom screws / tape posts -->
+  <circle cx="44" cy="136" r="3" fill="#13121A" opacity="0.6"></circle>
+  <circle cx="148" cy="136" r="3" fill="#13121A" opacity="0.6"></circle>
+
+  <!-- tiny Memphis dots -->
+  <circle cx="30" cy="58" r="2.2" fill="#ffe94a"></circle>
+  <circle cx="162" cy="58" r="2.2" fill="#ffe94a"></circle>
+</svg>

@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+PyJWT
+requests
+python-multipart
+billboard.py
