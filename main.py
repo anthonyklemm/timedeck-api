@@ -1,6 +1,6 @@
 import csv
 import json
-import os
+import sqlite3, os, pathlib
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +12,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
+# Where you’ve been saving the cache (match your seeding script/output)
+CACHE_DIR = os.getenv("CACHE_DIR", "/opt/render/project/src/cache")
+DB_PATH = os.getenv("YT_CACHE_DB", os.path.join(CACHE_DIR, "yt_cache.sqlite"))
 
+# Create cache dir if missing (harmless if it already exists)
+pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
 # ---------- Pydantic models ----------
 
 class SimRequest(BaseModel):
@@ -39,7 +44,20 @@ class SimResponse(BaseModel):
     seed: Optional[str]
     tracks: List[Track]
 
+class TrackIn(BaseModel):
+    artist: str = Field(..., min_length=1)
+    title:  str = Field(..., min_length=1)
 
+class ResolveReq(BaseModel):
+    region: str = "US"
+    limit: int = 50
+    tracks: list[TrackIn]
+
+class ResolveResp(BaseModel):
+    video_ids: list[str]
+    count: int
+    misses: list[dict]
+    
 # ---------- FastAPI app ----------
 
 app = FastAPI(title="TimeDeck API", version="1.0.0")
@@ -166,6 +184,19 @@ def read_tracks(csv_path: Path, limit: Optional[int]) -> List[Track]:
                 break
     return rows
 
+def _lookup_from_cache(conn: sqlite3.Connection, artist: str, title: str) -> str | None:
+    """
+    Works with the safe-cache script schema:
+      CREATE TABLE IF NOT EXISTS yt_cache (
+          key TEXT PRIMARY KEY,        -- lowercased "artist — title"
+          video_id TEXT NOT NULL,      -- canonical case (YouTube IDs are case-sensitive)
+          src TEXT,                    -- discogs|musicbrainz|search|cache
+          conf REAL                    -- 0..1 confidence
+      );
+    """
+    k = f"{artist.strip().lower()} — {title.strip().lower()}"
+    row = conn.execute("SELECT video_id FROM yt_cache WHERE key = ? LIMIT 1", (k,)).fetchone()
+    return row[0] if row else None
 
 # ---------- Routes ----------
 
@@ -193,3 +224,27 @@ def simulate(req: SimRequest):
         # clean up temp directory
         if csv_path:
             shutil.rmtree(csv_path.parent, ignore_errors=True)
+            
+@app.post("/v1/yt/resolve", response_model=ResolveResp)
+def yt_resolve(body: ResolveReq):
+    video_ids, misses = [], []
+
+    # If the DB isn't there yet, return empty (don’t 404)
+    if not os.path.exists(DB_PATH):
+        return ResolveResp(video_ids=[], count=0, misses=body.tracks[: body.limit])
+
+    # Query cache
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for t in body.tracks[: body.limit]:
+                vid = _lookup_from_cache(conn, t.artist, t.title)
+                if vid:
+                    video_ids.append(vid)
+                else:
+                    misses.append({"artist": t.artist, "title": t.title})
+    except Exception as e:
+        # Don’t leak internals; return empty but log server-side
+        print(f"[yt/resolve] cache error: {e}")
+        return ResolveResp(video_ids=[], count=0, misses=body.tracks[: body.limit])
+
+    return ResolveResp(video_ids=video_ids, count=len(video_ids), misses=misses)
