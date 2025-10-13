@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 import time, jwt
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,23 +60,38 @@ def health():
 
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
-    team_id = os.getenv("APPLE_TEAM_ID")
-    key_id  = os.getenv("APPLE_KEY_ID")
-    p8      = os.getenv("APPLE_PRIVATE_KEY")
-    if not (team_id and key_id and p8):
-        raise HTTPException(status_code=500, detail="Apple keys not configured")
+    # allow preset token OR mint from keys
+    preset = os.getenv("APPLE_MUSIC_DEV_TOKEN")
+    if preset:
+        return {"token": preset}
+
+    # accept either APPLE_MUSIC_* or APPLE_* names
+    team_id = os.getenv("APPLE_MUSIC_TEAM_ID") or os.getenv("APPLE_TEAM_ID")
+    key_id  = os.getenv("APPLE_MUSIC_KEY_ID")  or os.getenv("APPLE_KEY_ID")
+    p8      = os.getenv("APPLE_MUSIC_PRIVATE_KEY") or os.getenv("APPLE_PRIVATE_KEY")
+
+    missing = [k for k,v in {
+        "TEAM_ID": team_id, "KEY_ID": key_id, "PRIVATE_KEY": p8
+    }.items() if not v]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Apple keys not configured (missing: {', '.join(missing)})")
 
     p8_norm = p8.replace("\\n", "\n").strip()
     now = int(time.time())
-    payload = {"iss": team_id, "iat": now, "exp": now + 60*30}  # 30 min
-    token = jwt.encode(payload, p8_norm, algorithm="ES256",
-                       headers={"alg":"ES256","kid":key_id})
+    ttl = int(os.getenv("APPLE_MUSIC_TOKEN_TTL", "1800"))  # 30 min default
+    token = jwt.encode(
+        {"iss": team_id, "iat": now, "exp": now + ttl},
+        p8_norm,
+        algorithm="ES256",
+        headers={"alg": "ES256", "kid": key_id},
+    )
     return {"token": token}
 
-# keep the alias so the FE path works
+# keep the alias so FE can hit /dev-token
 @app.get("/dev-token")
 def dev_token_compat():
     return apple_dev_token()
+
 
 
 # ---------- Helpers ----------
