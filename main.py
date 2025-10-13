@@ -61,9 +61,9 @@ def health():
 
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
-    team_id = os.getenv("APPLE_MUSIC_TEAM_ID")
-    key_id  = os.getenv("APPLE_MUSIC_KEY_ID")
-    p8      = os.getenv("APPLE_MUSIC_PRIVATE_KEY")
+    team_id = os.getenv("APPLE_TEAM_ID")
+    key_id  = os.getenv("APPLE_KEY_ID")
+    p8      = os.getenv("APPLE_PRIVATE_KEY")
     if not (team_id and key_id and p8):
         raise HTTPException(status_code=500, detail="Apple keys not configured")
 
