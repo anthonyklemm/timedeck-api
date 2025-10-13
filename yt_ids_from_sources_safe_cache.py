@@ -34,10 +34,10 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 # ---------- Config ----------
-DISCOGS_TOKEN  = "gDHcyymczFqdmrmNFRiCAzAaEotfNfYzOQuxlldu"
+DISCOGS_TOKEN  = os.getenv("DISCOGS_TOKEN")
 DISCOGS_KEY    = os.getenv("DISCOGS_KEY")
 DISCOGS_SECRET = os.getenv("DISCOGS_SECRET")
-YOUTUBE_API_KEY = "REDACTED_YT_KEY"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 DEFAULT_REGION = os.getenv("YT_REGION", "US")
 HEADERS = {"User-Agent": "TimeDeck/1.0 (contact: you@example.com)"}
 
