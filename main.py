@@ -1,266 +1,193 @@
-import os, time, jwt, csv, io, textwrap, requests, random
-from datetime import datetime, timedelta
-from typing import List, Optional
+import csv, os, subprocess, uuid, json, shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-import billboard  # pip install billboard.py
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# ------------------ Apple credentials (ENV-based) ------------------
-TEAM_ID = os.getenv("APPLE_TEAM_ID", "")
-KEY_ID  = os.getenv("APPLE_KEY_ID", "")
-STOREFRONT = os.getenv("APPLE_STOREFRONT", "us")
+# ---------- Config ----------
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-def _read_private_key() -> str:
-    inline = os.getenv("APPLE_PRIVATE_KEY")
-    if inline:
-        return textwrap.dedent(inline).strip()
-    p = os.getenv("APPLE_PRIVATE_KEY_PATH")
-    if p and os.path.exists(p):
-        with open(p, "r") as f:
-            return f.read()
-    raise RuntimeError("Set APPLE_PRIVATE_KEY or APPLE_PRIVATE_KEY_PATH (and APPLE_TEAM_ID / APPLE_KEY_ID).")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+DISCOGS_TOKEN   = os.getenv("DISCOGS_TOKEN", "")
+DISCOGS_KEY     = os.getenv("DISCOGS_KEY", "")
+DISCOGS_SECRET  = os.getenv("DISCOGS_SECRET", "")
 
-PRIVATE_KEY = _read_private_key()
-APPLE_API = "https://api.music.apple.com/v1"
+# Allow your GitHub Pages front-end to call this API
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-def make_developer_token() -> str:
-    now = int(time.time())
-    payload = {"iss": TEAM_ID, "iat": now, "exp": now + 60*60*12}
-    headers = {"alg": "ES256", "kid": KEY_ID}
-    return jwt.encode(payload, PRIVATE_KEY, algorithm="ES256", headers=headers)
-
-def am_headers(dev_token: str, user_token: str):
-    return {"Authorization": f"Bearer {dev_token}",
-            "Music-User-Token": user_token,
-            "Accept": "application/json"}
-
-# ------------------ Simulator ------------------
-
-GENRE_TO_CHARTS = {
-    "alternative": ["modern-rock-tracks", "alternative-airplay", "alternative-songs"],
-    "alt":         ["modern-rock-tracks", "alternative-airplay", "alternative-songs"],
-    "pop":   ["pop-songs", "radio-songs", "hot-100"],
-    "top40": ["pop-songs", "radio-songs", "hot-100"],
-    "chr":   ["pop-songs", "radio-songs", "hot-100"],
-    "rock":            ["mainstream-rock", "rock-songs", "hot-100"],
-    "mainstream-rock": ["mainstream-rock", "rock-songs", "hot-100"],
-    "aaa":               ["adult-alternative-songs", "triple-a", "radio-songs"],
-    "adult-alternative": ["adult-alternative-songs", "triple-a", "radio-songs"],
-    "country": ["country-songs", "hot-100"],
-    "hiphop":  ["r-b-hip-hop-songs", "hot-100"],
-    "rnb":     ["r-b-hip-hop-songs", "hot-100"],
-    "latin":   ["latin-songs", "hot-100"],
-    "hot100":  ["hot-100"],
-}
-STATION_TO_GENRE = {"kroq":"alternative","kiis":"pop","z100":"pop","wxrt":"aaa","q101":"alternative","97x":"alternative"}
-
-class ChartEntry(BaseModel):
-    rank: int
-    artist: str
-    title: str
-
-class Spin(BaseModel):
-    timestamp: str  # ISO string
-    artist: str
-    title: str
-    source_rank: int
-
-def resolve_candidate_slugs(station: Optional[str], genre: Optional[str]) -> List[str]:
-    g = None
-    if station:
-        key = "".join(c for c in station.lower() if c.isalnum())
-        for k, gg in STATION_TO_GENRE.items():
-            if k in key: g = gg; break
-    if not g and genre: g = genre.lower().strip()
-    return GENRE_TO_CHARTS.get(g, ["hot-100"])
-
-def nearest_billboard_chart_date(user_date: datetime) -> str:
-    dow = user_date.weekday()  # Mon=0..Sat=5
-    days_until_sat = (5 - dow) % 7
-    return (user_date + timedelta(days=days_until_sat)).strftime("%Y-%m-%d")
-
-def fetch_chart_entries_strict(slugs: List[str], chart_date: str, limit: int = 40, tolerance_days: int = 7) -> List[ChartEntry]:
-    if not hasattr(billboard, "ChartData"):
-        raise RuntimeError("Wrong 'billboard' module; install billboard.py")
-    target_dt = datetime.strptime(chart_date, "%Y-%m-%d")
-    last_err = None
-    for slug in slugs:
-        try:
-            chart = billboard.ChartData(slug, date=chart_date)
-            if not chart.date: continue
-            returned_dt = datetime.strptime(chart.date, "%Y-%m-%d")
-            if abs((returned_dt - target_dt).days) > tolerance_days:
-                continue
-            out = [ChartEntry(rank=int(e.rank), artist=str(e.artist), title=str(e.title)) for e in chart[:limit]]
-            out.sort(key=lambda x: x.rank)
-            if out: return out
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"No chart within ±{tolerance_days} days for {chart_date}. Last error: {last_err}")
-
-def default_weight_for_rank(rank: int) -> float:
-    base = 1.0 if rank<=5 else 0.65 if rank<=10 else 0.40 if rank<=20 else 0.22 if rank<=30 else 0.12
-    decay = max(1.05 - 0.01*rank, 0.60)
-    return base*decay
-
-def simulate(entries: List[ChartEntry], start_time: datetime, hours: float, min_gap: int, seed: int) -> List[Spin]:
-    AVG_MIN = 3.5  # fixed
-    random.seed(seed)
-    weights = [(i, default_weight_for_rank(e.rank)) for i,e in enumerate(entries)]
-    total = sum(w for _,w in weights) or 1.0
-    pool = [(i, w/total) for i,w in weights]
-
-    def choose(now, last_played):
-        adjusted=[]
-        for i,p in pool:
-            last = last_played.get(i)
-            mins = (now-last).total_seconds()/60 if last else 9999
-            adjusted.append((i, p*(0.01 if mins<min_gap else 1.0)))
-        tot = sum(p for _,p in adjusted) or 1.0
-        r = random.random(); acc=0.0
-        for i,p in adjusted:
-            acc += p/tot
-            if r<=acc: return i
-        return adjusted[-1][0]
-
-    n = max(1, int(hours*60/AVG_MIN))
-    last_played={}; now=start_time; spins=[]
-    for _ in range(n):
-        idx = choose(now, last_played)
-        e = entries[idx]
-        spins.append(Spin(timestamp=now.isoformat(), artist=e.artist, title=e.title, source_rank=e.rank))
-        last_played[idx]=now
-        now += timedelta(minutes=AVG_MIN)
-    return spins
-
-def to_csv_text(spins: List[Spin]) -> str:
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["timestamp","artist","title","source_rank"])
-    for s in spins: w.writerow([s.timestamp, s.artist, s.title, s.source_rank])
-    return out.getvalue()
-
-def to_m3u_text(spins: List[Spin], title_comment: Optional[str]) -> str:
-    lines=["#EXTM3U"]
-    if title_comment: lines.append(f"#PLAYLIST:{title_comment}")
-    for s in spins:
-        t = datetime.fromisoformat(s.timestamp).strftime("%H:%M")
-        lines.append(f"#EXTINF:-1,{t} — {s.artist} - {s.title} (rank {s.source_rank})")
-        lines.append(f"{s.artist} - {s.title}")
-    return "\n".join(lines)
-
-# ------------------ FastAPI setup ------------------
-
-app = FastAPI()
+app = FastAPI(title="TapeDeck API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or restrict to your GitHub Pages origin later
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return open("static/index.html", "r", encoding="utf-8").read()
+# ---------- Models ----------
+class SimulateRequest(BaseModel):
+    date: str = Field(..., description="YYYY-MM-DD")
+    genre: str = Field(..., description="e.g., alternative, hot-100, rock")
+    hours: float = Field(4, description="Total hours of simulated spins")
+    min_gap: int = Field(90, description="Minutes before a song can repeat")
+    seed: Optional[str] = Field(None, description="Seed for deterministic runs")
 
-@app.get("/dev-token")
-def dev_token():
-    return {"token": make_developer_token(), "storefront": STOREFRONT}
-
-class SimulateParams(BaseModel):
-    date: str                 # YYYY-MM-DD
-    hours: float = 3.0
-    genre: Optional[str] = None
-    station: Optional[str] = None
-    min_gap: int = 90
-    seed: int = 97
-    limit: int = 40
-
-@app.post("/simulate")
-def simulate_endpoint(p: SimulateParams):
-    try:
-        d = datetime.strptime(p.date, "%Y-%m-%d")
-        start_dt = d.replace(hour=6, minute=0, second=0)  # fixed 06:00
-    except Exception:
-        raise HTTPException(400, "Bad date.")
-    slugs = resolve_candidate_slugs(p.station, p.genre)
-    chart_date = nearest_billboard_chart_date(d)
-    entries = fetch_chart_entries_strict(slugs, chart_date, limit=p.limit, tolerance_days=7)
-    spins = simulate(entries, start_dt, p.hours, p.min_gap, p.seed)
-    title = " | ".join(filter(None, [p.station or p.genre or slugs[0], p.date, f"{p.hours}h"]))
-    return {
-        "meta": {"slugs": slugs, "chart_week": chart_date, "used": len(entries), "title": title, "input_year": d.year},
-        "spins": [s.dict() for s in spins],
-        "csv": to_csv_text(spins),
-        "m3u": to_m3u_text(spins, title_comment=title),
-    }
-
-class SpinModel(BaseModel):
+class PlaylistItem(BaseModel):
     timestamp: str
     artist: str
     title: str
-    source_rank: int
+    year: Optional[str] = None
+    source_rank: Optional[int] = None
+    videoId: Optional[str] = None
+    resolve_source: Optional[str] = None
+    confidence: Optional[float] = None
 
-class CreatePayload(BaseModel):
-    userToken: str
-    name: str
-    spins: List[SpinModel]
-    storefront: Optional[str] = None
+class SimulateResponse(BaseModel):
+    playlist_id: str
+    title: str
+    count: int
+    items: List[PlaylistItem]
 
-def search_song(dev_token, user_token, storefront, artist, title, year_hint=None):
-    q = f"{artist} {title}" + (f" {year_hint}" if year_hint else "")
-    params = {"term": q, "limit": 5, "types": "songs"}
-    r = requests.get(f"{APPLE_API}/catalog/{storefront}/search",
-                     headers=am_headers(dev_token, user_token), params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+class ResolveRequest(BaseModel):
+    playlist_id: str
+    region: str = "US"
+    keep_duplicates: bool = False
+    prefer_search: bool = False
+    use_discogs: bool = True
+    use_musicbrainz: bool = False
+    fill_with_search: bool = True
+
+class ResolveResponse(BaseModel):
+    playlist_id: str
+    unique_videos: int
+    video_ids: List[str]
+    open_url: str
+    dropped: List[Dict[str, str]] = []
+
+# ---------- Helpers ----------
+def playlist_dir(pid: str) -> Path:
+    d = DATA_DIR / pid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def read_csv_items(csv_path: Path) -> List[Dict[str, Any]]:
+    out = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            out.append({
+                "timestamp": row.get("timestamp") or "",
+                "artist": row.get("artist") or "",
+                "title": row.get("title") or "",
+                "year": row.get("year") or None,
+                "source_rank": int(row.get("source_rank")) if row.get("source_rank") else None,
+            })
+    return out
+
+# ---------- Endpoints ----------
+@app.post("/v1/simulate", response_model=SimulateResponse)
+def simulate(req: SimulateRequest):
+    # 1) Create a playlist id & folder
+    pid = "pl_" + uuid.uuid4().hex[:12]
+    pdir = playlist_dir(pid)
+
+    # 2) Call your working simulator script
+    #    It should write pdir / "playlist.csv" and pdir / "playlist.m3u"
+    out_prefix = pdir / "playlist"
+    cmd = [
+        "python", "playlist_creator.py",
+        "--date", req.date,
+        "--genre", req.genre,
+        "--hours", str(req.hours),
+        "--min-gap", str(req.min_gap),
+        "--out", str(out_prefix),
+    ]
+    if req.seed:
+        cmd += ["--seed", req.seed]
+
     try:
-        return data["results"]["songs"]["data"][0]["id"]
-    except Exception:
-        return None
+        cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"simulate failed: {e.stdout}\n{e.stderr}")
 
-@app.post("/create-from-sim")
-def create_from_sim(payload: CreatePayload):
-    dev = make_developer_token()
-    sf = payload.storefront or STOREFRONT
+    csv_path = out_prefix.with_suffix(".csv")
+    if not csv_path.exists():
+        raise HTTPException(status_code=500, detail="simulate succeeded but CSV not found")
 
-    # Derive year hint from the first spin's timestamp
-    year_hint = None
+    items = read_csv_items(csv_path)
+    title = f"TimeDeck — {req.date} — {req.genre}"
+    return {
+        "playlist_id": pid,
+        "title": title,
+        "count": len(items),
+        "items": items,
+    }
+
+@app.post("/v1/resolve/youtube", response_model=ResolveResponse)
+def resolve_youtube(req: ResolveRequest):
+    pdir = playlist_dir(req.playlist_id)
+    csv_path = pdir / "playlist.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="playlist CSV not found; call /v1/simulate first")
+
+    outdir = pdir / "youtube"
+    if outdir.exists():
+        shutil.rmtree(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Build command to run your resolver with options
+    cmd = [
+        "python", "yt_ids_from_sources_safe_cache.py",
+        "--csv", str(csv_path),
+        "--outdir", str(outdir),
+        "--region", req.region,
+        "--limit", "1000",
+    ]
+    if req.fill_with_search: cmd += ["--fill-with-search"]
+    if req.prefer_search:    cmd += ["--prefer-search"]
+    if not req.use_discogs:  cmd += ["--no-discogs"]
+    if not req.use_musicbrainz: cmd += ["--no-mb"]
+
     try:
-        if payload.spins:
-            year_hint = datetime.fromisoformat(payload.spins[0].timestamp).year
-    except Exception:
-        year_hint = None
+        cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"resolve failed: {e.stdout}\n{e.stderr}")
 
-    # 1) create playlist
-    body = {"attributes": {"name": payload.name,
-                       "description": "Generated with TapeDeck Time Machine"}}
-    r = requests.post(f"{APPLE_API}/me/library/playlists",
-                      headers=am_headers(dev, payload.userToken), json=body, timeout=20)
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, f"Create playlist failed: {r.text}")
-    playlist_id = r.json()["data"][0]["id"]
+    vid_file = outdir / "video_ids.txt"
+    if not vid_file.exists():
+        raise HTTPException(status_code=500, detail="resolver wrote no video_ids.txt")
 
-    # 2) resolve tracks
-    catalog_ids=[]; misses=[]
-    for s in payload.spins:
-        cid = search_song(dev, payload.userToken, sf, s.artist, s.title, year_hint)
-        if cid: catalog_ids.append(cid)
-        else: misses.append({"artist": s.artist, "title": s.title})
+    video_ids = [ln.strip() for ln in vid_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    open_url = "https://www.youtube.com/watch_videos?video_ids=" + ",".join(video_ids)
 
-    # 3) add in chunks
-    CHUNK=80
-    for i in range(0, len(catalog_ids), CHUNK):
-        batch = {"data": [{"id": cid, "type": "songs"} for cid in catalog_ids[i:i+CHUNK]]}
-        r = requests.post(f"{APPLE_API}/me/library/playlists/{playlist_id}/tracks",
-                          headers=am_headers(dev, payload.userToken), json=batch, timeout=30)
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, f"Add tracks failed at batch {i}: {r.text}")
+    dropped = []
+    dropped_csv = outdir / "dropped.csv"
+    if dropped_csv.exists():
+        with dropped_csv.open(newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                dropped.append({"videoId": row.get("videoId",""), "reason": row.get("reason","")})
 
-    return {"playlist_id": playlist_id, "added": len(catalog_ids), "misses": misses}
+    if not req.keep_duplicates:
+        # Already deduped by your resolver, but keep this guard.
+        seen, uniq = set(), []
+        for vid in video_ids:
+            if vid not in seen:
+                seen.add(vid); uniq.append(vid)
+        video_ids = uniq
+
+    return {
+        "playlist_id": req.playlist_id,
+        "unique_videos": len(video_ids),
+        "video_ids": video_ids,
+        "open_url": open_url,
+        "dropped": dropped,
+    }
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
