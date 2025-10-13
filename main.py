@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+import time, jwt
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -58,18 +59,26 @@ def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
 
 
-# Apple Music dev token endpoint you already use from the front-end
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
-    token = os.getenv("APPLE_MUSIC_DEV_TOKEN", "")
-    if not token:
-        raise HTTPException(status_code=500, detail="APPLE_MUSIC_DEV_TOKEN not set")
+    team_id = os.getenv("APPLE_MUSIC_TEAM_ID")
+    key_id  = os.getenv("APPLE_MUSIC_KEY_ID")
+    p8      = os.getenv("APPLE_MUSIC_PRIVATE_KEY")
+    if not (team_id and key_id and p8):
+        raise HTTPException(status_code=500, detail="Apple keys not configured")
+
+    p8_norm = p8.replace("\\n", "\n").strip()
+    now = int(time.time())
+    payload = {"iss": team_id, "iat": now, "exp": now + 60*30}  # 30 min
+    token = jwt.encode(payload, p8_norm, algorithm="ES256",
+                       headers={"alg":"ES256","kid":key_id})
     return {"token": token}
 
+# keep the alias so the FE path works
 @app.get("/dev-token")
 def dev_token_compat():
-    # forward to the official endpoint
     return apple_dev_token()
+
 
 # ---------- Helpers ----------
 
