@@ -49,9 +49,9 @@ class TrackIn(BaseModel):
     title:  str = Field(..., min_length=1)
 
 class ResolveReq(BaseModel):
-    region: str = "US"
-    limit: int = 50
-    tracks: list[TrackIn]
+    tracks: List[dict]   # [{artist, title, year?, timestamp?}]
+    region: Optional[str] = "US"
+    limit: Optional[int] = 50
 
 class ResolveResp(BaseModel):
     video_ids: list[str]
@@ -62,14 +62,21 @@ class ResolveResp(BaseModel):
 
 app = FastAPI(title="TimeDeck API", version="1.0.0")
 
+# IMPORTANT: the Origin for GitHub Pages is just scheme+host (no path)
+allowed = os.getenv("ALLOWED_ORIGINS", "")
+allow_origins = [o.strip() for o in allowed.split(",") if o.strip()]
+if not allow_origins:
+    # safe default for local tests; keep tight in prod
+    allow_origins = ["http://localhost:8000", "http://127.0.0.1:8000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://anthonyklemm.github.io"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allow_origins,
+    allow_credentials=True,          # OK even if you don’t use cookies
+    allow_methods=["*"],             # lets POST/OPTIONS through
+    allow_headers=["*"],             # allow custom headers
+    expose_headers=["*"],
 )
-
 
 @app.get("/health")
 def health():
@@ -110,7 +117,11 @@ def apple_dev_token():
 def dev_token_compat():
     return apple_dev_token()
 
-
+@app.post("/v1/yt/resolve")
+def yt_resolve(req: ResolveReq):
+    # call your cache-first resolver and return:
+    # { "ids": ["zvCBSSwgtg4", ...], "dropped": [...], "sources": {...} }
+    return your_resolve_impl(req)
 
 # ---------- Helpers ----------
 
