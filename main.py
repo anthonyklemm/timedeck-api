@@ -10,6 +10,8 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # ---------- Pydantic models ----------
 
@@ -42,6 +44,14 @@ class SimResponse(BaseModel):
 
 app = FastAPI(title="TimeDeck API", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://anthonyklemm.github.io"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
 def health():
@@ -56,6 +66,10 @@ def apple_dev_token():
         raise HTTPException(status_code=500, detail="APPLE_MUSIC_DEV_TOKEN not set")
     return {"token": token}
 
+@app.get("/dev-token")
+def dev_token_compat():
+    # forward to the official endpoint
+    return apple_dev_token()
 
 # ---------- Helpers ----------
 
