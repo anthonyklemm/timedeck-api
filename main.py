@@ -118,10 +118,9 @@ def dev_token_compat():
     return apple_dev_token()
 
 @app.post("/v1/yt/resolve")
-def yt_resolve(req: ResolveReq):
-    # call your cache-first resolver and return:
-    # { "ids": ["zvCBSSwgtg4", ...], "dropped": [...], "sources": {...} }
-    return your_resolve_impl(req)
+def yt_resolve(req: YoutubeResolveRequest) -> YoutubeResolveResponse:
+    # TODO: Implement this function.
+    return resolve_impl(req)
 
 # ---------- Helpers ----------
 
