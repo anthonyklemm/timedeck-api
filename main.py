@@ -108,29 +108,37 @@ def _discogs_find_video_id(artist: str, title: str) -> Optional[str]:
         return None
     q = f"{artist} - {title}"
     try:
+        # Step 1: Search for the track
         r = requests.get(
             "https://api.discogs.com/database/search",
-            params={"q": q, "per_page": 5, "page": 1, "token": DISCOGS_TOKEN},
+            params={"q": q, "per_page": 1, "page": 1, "token": DISCOGS_TOKEN}, # Ask for just 1 result
             timeout=12,
         )
         if r.status_code != 200:
             return None
-        data = r.json()
-        results = data.get("results", [])[:5]
-        for item in results:
-            res_url = item.get("resource_url")
-            if not res_url:
-                continue
-            d = requests.get(res_url, timeout=12)
-            if d.status_code != 200:
-                continue
-            obj = d.json()
-            for v in obj.get("videos", []) or []:
-                uri = v.get("uri") or v.get("url") or ""
-                if _is_youtube_url(uri):
-                    vid = _extract_video_id(uri)
-                    if vid:
-                        return vid
+        
+        results = r.json().get("results", [])
+        if not results:
+            return None # No search results found
+
+        # Step 2: Get details for ONLY the first result
+        item = results[0]
+        res_url = item.get("resource_url")
+        if not res_url:
+            return None
+
+        d = requests.get(res_url, timeout=12)
+        if d.status_code != 200:
+            return None
+
+        obj = d.json()
+        for v in obj.get("videos", []) or []:
+            uri = v.get("uri") or v.get("url") or ""
+            if _is_youtube_url(uri):
+                vid = _extract_video_id(uri)
+                if vid:
+                    return vid # Return the very first video ID we find
+                    
     except Exception as e:
         log.warning("Discogs lookup failed for %s — %s", q, e)
     return None
