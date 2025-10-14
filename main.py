@@ -94,7 +94,7 @@ def _cache_get(conn: sqlite3.Connection, k: str) -> Optional[str]:
     row = cur.fetchone()
     return row[0] if row else None
 
-def _cache_put(conn: sqlite.Connection, k: str, vid: str) -> None:
+def _cache_put(conn: sqlite3.Connection, k: str, vid: str) -> None:
     conn.execute("INSERT OR REPLACE INTO cache (k, video_id, ts) VALUES (?,?,?)", (k, vid, int(time.time())))
     conn.commit()
 
