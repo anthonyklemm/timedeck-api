@@ -1,260 +1,280 @@
-import csv
+# main.py
+# FastAPI backend for TapeDeck Time Machine
+# Endpoints:
+#   GET  /health
+#   POST /v1/simulate        -> uses playlist_creator.py to build spins
+#   POST /v1/yt/resolve      -> resolves {artist,title} -> YouTube videoIds (cache + Discogs)
+#   GET  /v1/apple/dev-token -> emits a MusicKit developer token (JWT)
+
+import os
+import re
+import time
 import json
-import sqlite3, os, pathlib
-import shutil
-import subprocess
-import tempfile
-from datetime import datetime
-from pathlib import Path
-from typing import List, Optional
-import time, jwt
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+import sqlite3
+import logging
+from typing import List, Optional, Dict, Tuple
+from datetime import datetime, timedelta
+
+import requests
+import jwt  # PyJWT
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
-# Where you’ve been saving the cache (match your seeding script/output)
-CACHE_DIR = os.getenv("CACHE_DIR", "/opt/render/project/src/cache")
-DB_PATH = os.getenv("YT_CACHE_DB", os.path.join(CACHE_DIR, "yt_cache.sqlite"))
+# --- import simulator bits from your existing script ---
+from playlist_creator import (
+    resolve_candidate_slugs,
+    nearest_billboard_chart_date,
+    fetch_chart_entries_strict,
+    simulate_rotations,
+)
 
-# Create cache dir if missing (harmless if it already exists)
-pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-# ---------- Pydantic models ----------
+# -------------------- config / logging --------------------
 
-class SimRequest(BaseModel):
-    date: str = Field(..., description="YYYY-MM-DD")
-    genre: str
-    hours: float = 3.0
-    repeat_gap_min: int = 90
-    seed: Optional[str] = None
-    limit: Optional[int] = None  # optional 'first N' rows to return
+APP_NAME = "timedeck-api"
+log = logging.getLogger(APP_NAME)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
+ALLOWED = os.getenv("ALLOWED_ORIGINS", "https://anthonyklemm.github.io").split(",")
+CACHE_DIR = os.getenv("CACHE_DIR", "/data")
+os.makedirs(CACHE_DIR, exist_ok=True)
+CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
 
-class Track(BaseModel):
-    timestamp: str
-    artist: str
-    title: str
-    source_rank: Optional[int] = None
+DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", "").strip()
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID")
+APPLE_KEY_ID = os.getenv("APPLE_KEY_ID")
+APPLE_PRIVATE_KEY = os.getenv("APPLE_PRIVATE_KEY")
+APPLE_STOREFRONT = os.getenv("APPLE_STOREFRONT", "us")
 
-class SimResponse(BaseModel):
-    date: str
-    genre: str
-    hours: float
-    repeat_gap_min: int
-    seed: Optional[str]
-    tracks: List[Track]
+# -------------------- FastAPI app + CORS --------------------
 
-class TrackIn(BaseModel):
-    artist: str = Field(..., min_length=1)
-    title:  str = Field(..., min_length=1)
-
-class ResolveReq(BaseModel):
-    tracks: List[dict]   # [{artist, title, year?, timestamp?}]
-    region: Optional[str] = "US"
-    limit: Optional[int] = 50
-
-class ResolveResp(BaseModel):
-    video_ids: list[str]
-    count: int
-    misses: list[dict]
-    
-# ---------- FastAPI app ----------
-
-app = FastAPI(title="TimeDeck API", version="1.0.0")
-
-# IMPORTANT: the Origin for GitHub Pages is just scheme+host (no path)
-allowed = os.getenv("ALLOWED_ORIGINS", "")
-allow_origins = [o.strip() for o in allowed.split(",") if o.strip()]
-if not allow_origins:
-    # safe default for local tests; keep tight in prod
-    allow_origins = ["http://localhost:8000", "http://127.0.0.1:8000"]
+app = FastAPI(title="TapeDeck API", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,          # OK even if you don’t use cookies
-    allow_methods=["*"],             # lets POST/OPTIONS through
-    allow_headers=["*"],             # allow custom headers
-    expose_headers=["*"],
+    allow_origins=[o.strip() for o in ALLOWED if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    max_age=600,
 )
+
+# -------------------- utils --------------------
+
+def _norm_key(artist: str, title: str) -> str:
+    def clean(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    return f"{clean(artist)} :: {clean(title)}"
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(CACHE_DB)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, video_id TEXT, ts INTEGER)"
+    )
+    return conn
+
+def _cache_get(conn: sqlite3.Connection, k: str) -> Optional[str]:
+    cur = conn.execute("SELECT video_id FROM cache WHERE k=?", (k,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def _cache_put(conn: sqlite3.Connection, k: str, vid: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO cache (k, video_id, ts) VALUES (?,?,?)",
+                 (k, vid, int(time.time())))
+    conn.commit()
+
+def _is_youtube_url(u: str) -> bool:
+    return "youtube.com/watch" in u or "youtu.be/" in u
+
+def _extract_video_id(u: str) -> Optional[str]:
+    # Handles typical forms like https://www.youtube.com/watch?v=ABC123 and https://youtu.be/ABC123
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{8,})", u)
+    if m:
+        return m.group(1)
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{8,})", u)
+    if m:
+        return m.group(1)
+    return None
+
+def _discogs_find_video_id(artist: str, title: str) -> Optional[str]:
+    if not DISCOGS_TOKEN:
+        return None
+    q = f"{artist} - {title}"
+    try:
+        r = requests.get(
+            "https://api.discogs.com/database/search",
+            params={"q": q, "per_page": 5, "page": 1, "token": DISCOGS_TOKEN},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        results = data.get("results", [])[:5]
+        for item in results:
+            res_url = item.get("resource_url")
+            if not res_url:
+                continue
+            d = requests.get(res_url, timeout=12)
+            if d.status_code != 200:
+                continue
+            obj = d.json()
+            for v in obj.get("videos", []) or []:
+                uri = v.get("uri") or v.get("url") or ""
+                if _is_youtube_url(uri):
+                    vid = _extract_video_id(uri)
+                    if vid:
+                        return vid
+    except Exception as e:
+        log.warning("Discogs lookup failed for %s — %s", q, e)
+    return None
+
+# -------------------- models --------------------
+
+class SimReq(BaseModel):
+    date: str                   # "YYYY-MM-DD"
+    genre: Optional[str] = None
+    station: Optional[str] = None
+    hours: float = 3.0
+    repeat_gap_min: int = Field(90, ge=0)
+    seed: str = "97"
+    limit: int = Field(40, ge=1, le=1000)
+
+class Track(BaseModel):
+    artist: str
+    title: str
+
+class ResolveReq(BaseModel):
+    tracks: List[Track]
+    region: Optional[str] = "US"
+    limit: Optional[int] = 50
+
+# -------------------- endpoints --------------------
 
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
 
+@app.post("/v1/simulate")
+def simulate(req: SimReq):
+    try:
+        # Resolve slugs for the user's genre/station
+        slugs = resolve_candidate_slugs(req.station, req.genre)
+
+        # Billboard chart week (Saturday on/after given date)
+        # nearest_billboard_chart_date expects a datetime
+        d = datetime.strptime(req.date, "%Y-%m-%d")
+        chart_date = nearest_billboard_chart_date(d)
+
+        # Strict fetch for that week
+        entries = fetch_chart_entries_strict(slugs, chart_date, limit=req.limit, tolerance_days=7)
+
+        # Start 06:00; avg length fixed at 3.5 as per your UX
+        start_dt = d.replace(hour=6, minute=0, second=0, microsecond=0)
+        spins = simulate_rotations(
+            entries=entries,
+            start_time=start_dt,
+            hours=req.hours,
+            average_song_minutes=3.5,
+            min_gap_minutes=req.repeat_gap_min,
+            seed=int(req.seed or "97"),
+        )
+
+        return {
+            "date": req.date,
+            "genre": req.genre or "",
+            "hours": req.hours,
+            "repeat_gap_min": req.repeat_gap_min,
+            "seed": req.seed,
+            "tracks": [
+                {
+                    "timestamp": s.timestamp.isoformat(timespec="minutes"),
+                    "artist": s.artist,
+                    "title": s.title,
+                    "source_rank": s.source_rank,
+                }
+                for s in spins
+            ],
+        }
+    except Exception as e:
+        log.exception("simulate failed")
+        return JSONResponse(status_code=500, content={"detail": f"simulate failed: {e}"})
+
+@app.post("/v1/yt/resolve")
+def yt_resolve(req: ResolveReq):
+    """
+    Cache-first YouTube resolver.
+    - looks in sqlite cache
+    - tries Discogs videos as a fallback
+    (You can extend with MusicBrainz or YouTube Data API later.)
+    """
+    try:
+        conn = _db()
+        ids: List[str] = []
+        dropped: List[Dict] = []
+        seen: set = set()
+        stats = {"cache": 0, "discogs": 0}
+
+        for t in req.tracks:
+            if len(ids) >= (req.limit or 50):
+                break
+            k = _norm_key(t.artist, t.title)
+            vid = _cache_get(conn, k)
+            if vid:
+                stats["cache"] += 1
+            else:
+                vid = _discogs_find_video_id(t.artist, t.title)
+                if vid:
+                    stats["discogs"] += 1
+                    _cache_put(conn, k, vid)
+
+            # dedupe and collect
+            if vid and vid not in seen:
+                seen.add(vid)
+                ids.append(vid)
+            else:
+                dropped.append({"artist": t.artist, "title": t.title, "reason": "not_found"})
+
+        return {"ids": ids, "dropped": dropped, "sources": stats}
+    except Exception as e:
+        log.exception("yt/resolve failed")
+        return JSONResponse(status_code=500, content={"detail": f"yt/resolve failed: {e}"})
 
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
-    # allow preset token OR mint from keys
-    preset = os.getenv("APPLE_MUSIC_DEV_TOKEN")
-    if preset:
-        return {"token": preset}
-
-    # accept either APPLE_MUSIC_* or APPLE_* names
-    team_id = os.getenv("APPLE_MUSIC_TEAM_ID") or os.getenv("APPLE_TEAM_ID")
-    key_id  = os.getenv("APPLE_MUSIC_KEY_ID")  or os.getenv("APPLE_KEY_ID")
-    p8      = os.getenv("APPLE_MUSIC_PRIVATE_KEY") or os.getenv("APPLE_PRIVATE_KEY")
-
-    missing = [k for k,v in {
-        "TEAM_ID": team_id, "KEY_ID": key_id, "PRIVATE_KEY": p8
-    }.items() if not v]
-    if missing:
-        raise HTTPException(status_code=500, detail=f"Apple keys not configured (missing: {', '.join(missing)})")
-
-    p8_norm = p8.replace("\\n", "\n").strip()
-    now = int(time.time())
-    ttl = int(os.getenv("APPLE_MUSIC_TOKEN_TTL", "1800"))  # 30 min default
-    token = jwt.encode(
-        {"iss": team_id, "iat": now, "exp": now + ttl},
-        p8_norm,
-        algorithm="ES256",
-        headers={"alg": "ES256", "kid": key_id},
-    )
-    return {"token": token}
-
-# keep the alias so FE can hit /dev-token
-@app.get("/dev-token")
-def dev_token_compat():
-    return apple_dev_token()
-
-@app.post("/v1/yt/resolve")
-def yt_resolve(req: YoutubeResolveRequest) -> YoutubeResolveResponse:
-    # TODO: Implement this function.
-    return resolve_impl(req)
-
-# ---------- Helpers ----------
-
-def run_playlist_creator(req: SimRequest) -> Path:
     """
-    Call playlist_creator.py as a subprocess, write outputs to a tmp dir,
-    and return the path to the produced CSV file.
+    Issue a MusicKit developer token from env:
+      APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_PRIVATE_KEY
     """
-    repo_root = Path(__file__).resolve().parent
-    script = repo_root / "playlist_creator.py"
-    if not script.exists():
-        raise HTTPException(status_code=500, detail="playlist_creator.py not found in API container")
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="sim_"))
-    out_base = tmpdir / "sim_output"
-
-    # Build the command — we keep avg-mins fixed at 3.5 as agreed
-    cmd = [
-        "python", str(script),
-        "--date", req.date,
-        "--genre", req.genre,
-        "--hours", str(req.hours),
-        "--avg-mins", "3.5",
-        "--min-gap", str(req.repeat_gap_min),
-        "--out", str(out_base)
-    ]
-    if req.seed:
-        cmd += ["--seed", req.seed]
-
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
+        if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
+            return JSONResponse(status_code=400, content={"detail": "Apple keys not configured"})
+        now = int(time.time())
+        payload = {
+            "iss": APPLE_TEAM_ID,
+            "iat": now,
+            "exp": now + 60 * 55,   # ~55 minutes
+        }
+        token = jwt.encode(
+            payload,
+            APPLE_PRIVATE_KEY,
+            algorithm="ES256",
+            headers={"kid": APPLE_KEY_ID, "alg": "ES256"},
         )
+        return {"token": token, "storefront": APPLE_STOREFRONT}
     except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"failed to start playlist_creator: {e}")
+        log.exception("dev-token failed")
+        return JSONResponse(status_code=500, content={"detail": f"dev-token failed: {e}"})
 
-    if proc.returncode != 0:
-        log_tail = proc.stdout[-2000:] if proc.stdout else ""
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"playlist_creator failed ({proc.returncode}):\n{log_tail}")
+@app.get("/")
+def root():
+    return PlainTextResponse(f"{APP_NAME} OK")
 
-    csv_path = out_base.with_suffix(".csv")
-    if not csv_path.exists():
-        log_tail = proc.stdout[-2000:] if proc.stdout else ""
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"CSV not found at {csv_path}.\n{log_tail}")
-
-    # Leave tmpdir in place so we can read the CSV; caller cleans up.
-    return csv_path
-
-
-def read_tracks(csv_path: Path, limit: Optional[int]) -> List[Track]:
-    rows: List[Track] = []
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for i, r in enumerate(reader):
-            rows.append(
-                Track(
-                    timestamp=r.get("timestamp", ""),
-                    artist=r.get("artist", ""),
-                    title=r.get("title", ""),
-                    source_rank=int(r["source_rank"]) if r.get("source_rank") else None,
-                )
-            )
-            if limit and len(rows) >= limit:
-                break
-    return rows
-
-def _lookup_from_cache(conn: sqlite3.Connection, artist: str, title: str) -> str | None:
-    """
-    Works with the safe-cache script schema:
-      CREATE TABLE IF NOT EXISTS yt_cache (
-          key TEXT PRIMARY KEY,        -- lowercased "artist — title"
-          video_id TEXT NOT NULL,      -- canonical case (YouTube IDs are case-sensitive)
-          src TEXT,                    -- discogs|musicbrainz|search|cache
-          conf REAL                    -- 0..1 confidence
-      );
-    """
-    k = f"{artist.strip().lower()} — {title.strip().lower()}"
-    row = conn.execute("SELECT video_id FROM yt_cache WHERE key = ? LIMIT 1", (k,)).fetchone()
-    return row[0] if row else None
-
-# ---------- Routes ----------
-
-@app.post("/v1/simulate", response_model=SimResponse)
-def simulate(req: SimRequest):
-    # light validation
-    try:
-        datetime.strptime(req.date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
-
-    csv_path = None
-    try:
-        csv_path = run_playlist_creator(req)
-        tracks = read_tracks(csv_path, req.limit)
-        return SimResponse(
-            date=req.date,
-            genre=req.genre,
-            hours=req.hours,
-            repeat_gap_min=req.repeat_gap_min,
-            seed=req.seed,
-            tracks=tracks,
-        )
-    finally:
-        # clean up temp directory
-        if csv_path:
-            shutil.rmtree(csv_path.parent, ignore_errors=True)
-            
-@app.post("/v1/yt/resolve", response_model=ResolveResp)
-def yt_resolve(body: ResolveReq):
-    video_ids, misses = [], []
-
-    # If the DB isn't there yet, return empty (don’t 404)
-    if not os.path.exists(DB_PATH):
-        return ResolveResp(video_ids=[], count=0, misses=body.tracks[: body.limit])
-
-    # Query cache
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            for t in body.tracks[: body.limit]:
-                vid = _lookup_from_cache(conn, t.artist, t.title)
-                if vid:
-                    video_ids.append(vid)
-                else:
-                    misses.append({"artist": t.artist, "title": t.title})
-    except Exception as e:
-        # Don’t leak internals; return empty but log server-side
-        print(f"[yt/resolve] cache error: {e}")
-        return ResolveResp(video_ids=[], count=0, misses=body.tracks[: body.limit])
-
-    return ResolveResp(video_ids=video_ids, count=len(video_ids), misses=misses)
+# -------------------- uvicorn entry (Render uses: uvicorn main:app ...) --------------------
+# no __main__ needed for Render; keep file simple
