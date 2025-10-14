@@ -6,8 +6,8 @@ import time
 import json
 import sqlite3
 import logging
-from datetime import datetime
 from typing import List, Optional, Dict
+from datetime import datetime
 
 import requests
 import jwt  # PyJWT
@@ -30,8 +30,7 @@ APP_NAME = "timedeck-api"
 log = logging.getLogger(APP_NAME)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# **FIXED**: Added newline and www version for the custom domain
-ALLOWED = os.getenv("ALLOWED_ORIGINS", "https://anthonyklemm.github.io,https://tapedecktimemachine.com,https://www.tapedecktimemachine.com").split(",")
+ALLOWED = os.getenv("ALLOWED_ORIGINS", "https://tapedecktimemachine.com").split(",")
 CACHE_DIR = os.getenv("CACHE_DIR", "/data")  # Correct path for Render Persistent Disks
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
@@ -243,4 +242,5 @@ def apple_create_playlist(req: AppleCreateRequest):
 @app.get("/")
 def root():
     return PlainTextResponse(f"{APP_NAME} OK")
+
 
