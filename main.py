@@ -36,10 +36,26 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
 
 DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", "").strip()
-APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID")
-APPLE_KEY_ID = os.getenv("APPLE_KEY_ID")
-APPLE_PRIVATE_KEY = os.getenv("APPLE_PRIVATE_KEY")
-APPLE_STOREFRONT = os.getenv("APPLE_STOREFRONT", "us")
+
+# --- MODIFICATIONS START HERE ---
+
+# Strip whitespace from env vars
+APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID", "").strip()
+APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "").strip()
+APPLE_STOREFRONT = os.getenv("APPLE_STOREFRONT", "us").strip()
+APPLE_PRIVATE_KEY_RAW = os.getenv("APPLE_PRIVATE_KEY", "").strip()
+APPLE_PRIVATE_KEY = None
+
+# Check if the key is mangled (a single line with \n)
+if APPLE_PRIVATE_KEY_RAW and "\\n" in APPLE_PRIVATE_KEY_RAW:
+    log.info("Found escaped newlines in APPLE_PRIVATE_KEY, replacing them.")
+    # Rebuild the key with actual newlines
+    APPLE_PRIVATE_KEY = APPLE_PRIVATE_KEY_RAW.replace("\\n", "\n")
+elif APPLE_PRIVATE_KEY_RAW:
+    # Assume it's a correct, multi-line key
+    APPLE_PRIVATE_KEY = APPLE_PRIVATE_KEY_RAW
+
+# --- MODIFICATIONS END HERE ---
 
 # -------------------- Pydantic Models (defined at the top) --------------------
 class SimReq(BaseModel):
@@ -184,13 +200,21 @@ def yt_resolve(req: ResolveReq):
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
     try:
+        # --- MODIFIED: Stricter check ---
         if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
+            log.error("Apple keys not configured. TEAM_ID, KEY_ID, or PRIVATE_KEY is missing.")
             return JSONResponse(status_code=500, content={"detail": "Apple keys not configured"})
+        # --- END MODIFIED ---
+            
         now = int(time.time())
         payload = {"iss": APPLE_TEAM_ID, "iat": now, "exp": now + (60 * 55)}
+        
+        # This will now use the un-mangled key
         token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID, "alg": "ES256"})
+        
         return {"token": token, "storefront": APPLE_STOREFRONT}
     except Exception as e:
+        # This block will now catch any PyJWT errors from a bad (but non-empty) key
         log.exception("dev-token failed")
         return JSONResponse(status_code=500, content={"detail": f"dev-token failed: {e}"})
 
@@ -242,5 +266,3 @@ def apple_create_playlist(req: AppleCreateRequest):
 @app.get("/")
 def root():
     return PlainTextResponse(f"{APP_NAME} OK")
-
-
