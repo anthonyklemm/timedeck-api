@@ -37,25 +37,30 @@ CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
 
 DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", "").strip()
 
-# --- MODIFICATIONS START HERE ---
-
-# Strip whitespace from env vars
+# --- MODIFIED: Added logging to check env var state ---
 APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID", "").strip()
 APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "").strip()
 APPLE_STOREFRONT = os.getenv("APPLE_STOREFRONT", "us").strip()
 APPLE_PRIVATE_KEY_RAW = os.getenv("APPLE_PRIVATE_KEY", "").strip()
 APPLE_PRIVATE_KEY = None
 
-# Check if the key is mangled (a single line with \n)
+# This is our new logging block
+log.info("--- Apple Key Diagnostics ---")
+log.info(f"APPLE_TEAM_ID loaded: {bool(APPLE_TEAM_ID)}, Length: {len(APPLE_TEAM_ID)}")
+log.info(f"APPLE_KEY_ID loaded: {bool(APPLE_KEY_ID)}, Length: {len(APPLE_KEY_ID)}")
+log.info(f"APPLE_PRIVATE_KEY_RAW loaded: {bool(APPLE_PRIVATE_KEY_RAW)}, Length: {len(APPLE_PRIVATE_KEY_RAW)}")
+
 if APPLE_PRIVATE_KEY_RAW and "\\n" in APPLE_PRIVATE_KEY_RAW:
     log.info("Found escaped newlines in APPLE_PRIVATE_KEY, replacing them.")
-    # Rebuild the key with actual newlines
     APPLE_PRIVATE_KEY = APPLE_PRIVATE_KEY_RAW.replace("\\n", "\n")
 elif APPLE_PRIVATE_KEY_RAW:
-    # Assume it's a correct, multi-line key
+    log.info("No escaped newlines found in private key. Using as-is.")
     APPLE_PRIVATE_KEY = APPLE_PRIVATE_KEY_RAW
+else:
+    log.warning("APPLE_PRIVATE_KEY is empty after loading and stripping.")
+log.info("-----------------------------")
+# --- END MODIFIED BLOCK ---
 
-# --- MODIFICATIONS END HERE ---
 
 # -------------------- Pydantic Models (defined at the top) --------------------
 class SimReq(BaseModel):
@@ -93,6 +98,7 @@ app.add_middleware(
 )
 
 # -------------------- Utils --------------------
+# ... (all your _norm_key, _db, _cache functions remain unchanged) ...
 def _norm_key(artist: str, title: str) -> str:
     def clean(s: str) -> str:
         s = s.lower()
@@ -116,7 +122,7 @@ def _cache_put(conn: sqlite3.Connection, k: str, vid: str) -> None:
     conn.commit()
 
 def _extract_video_id(u: str) -> Optional[str]:
-    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", u) or re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", u)
+    m = re.search(r"[?&]v=([A-Za-z0_A-Za-z0-9_-]{11})", u) or re.search(r"youtu\.be/([A-Za-z0_A-Za-z0-9_-]{11})", u)
     return m.group(1) if m else None
 
 def _discogs_find_video_id(artist: str, title: str) -> Optional[str]:
@@ -155,6 +161,7 @@ def health():
 
 @app.post("/v1/simulate")
 def simulate(req: SimReq):
+    # ... (simulate function remains unchanged) ...
     try:
         slugs = resolve_candidate_slugs(req.station, req.genre)
         d = datetime.strptime(req.date, "%Y-%m-%d")
@@ -178,6 +185,7 @@ def simulate(req: SimReq):
 
 @app.post("/v1/yt/resolve")
 def yt_resolve(req: ResolveReq):
+    # ... (yt_resolve function remains unchanged) ...
     try:
         conn = _db()
         ids, dropped, seen = [], [], set()
@@ -200,26 +208,28 @@ def yt_resolve(req: ResolveReq):
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
     try:
-        # --- MODIFIED: Stricter check ---
+        # This check is now based on the final, processed variables
         if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
-            log.error("Apple keys not configured. TEAM_ID, KEY_ID, or PRIVATE_KEY is missing.")
+            log.error("CRITICAL: Apple keys not configured. TEAM_ID, KEY_ID, or PRIVATE_KEY is missing or empty after processing.")
             return JSONResponse(status_code=500, content={"detail": "Apple keys not configured"})
-        # --- END MODIFIED ---
             
         now = int(time.time())
         payload = {"iss": APPLE_TEAM_ID, "iat": now, "exp": now + (60 * 55)}
         
-        # This will now use the un-mangled key
         token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID, "alg": "ES256"})
+        
+        # --- MODIFIED: Added log to check the generated token ---
+        log.info(f"Successfully generated a dev token. Length: {len(token)}")
+        # --- END MODIFIED ---
         
         return {"token": token, "storefront": APPLE_STOREFRONT}
     except Exception as e:
-        # This block will now catch any PyJWT errors from a bad (but non-empty) key
-        log.exception("dev-token failed")
+        log.exception(f"CRITICAL: dev-token failed during jwt.encode(). This almost always means the KEY_ID, TEAM_ID, or Private Key are incorrect. Error: {e}")
         return JSONResponse(status_code=500, content={"detail": f"dev-token failed: {e}"})
 
 @app.post("/v1/apple/create-playlist")
 def apple_create_playlist(req: AppleCreateRequest):
+    # ... (create_playlist function remains unchanged) ...
     if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
         return JSONResponse(status_code=500, content={"detail": "Apple keys not configured"})
     try:
@@ -232,7 +242,7 @@ def apple_create_playlist(req: AppleCreateRequest):
     
     try:
         playlist_payload = {"attributes": {"name": req.name, "description": "Generated by TapeDeck Time Machine"}}
-        r_create = requests.post("https://api.music.apple.com/v1/me/library/playlists", headers=headers, json=playlist_payload)
+        r__create = requests.post("https://api.music.apple.com/v1/me/library/playlists", headers=headers, json=playlist_payload)
         r_create.raise_for_status()
         playlist_id = r_create.json()["data"][0]["id"]
     except Exception as e:
