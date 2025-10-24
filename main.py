@@ -216,7 +216,8 @@ def apple_dev_token():
         now = int(time.time())
         payload = {"iss": APPLE_TEAM_ID, "iat": now, "exp": now + (60 * 55)}
         
-        token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID, "alg": "ES256"})
+        token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID})
+        #token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID, "alg": "ES256"})
         
         # --- MODIFIED: Added log to check the generated token ---
         log.info(f"Successfully generated a dev token. Length: {len(token)}")
