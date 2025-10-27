@@ -12,7 +12,7 @@ from datetime import datetime
 import requests
 import jwt  # PyJWT
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -30,8 +30,11 @@ APP_NAME = "timedeck-api"
 log = logging.getLogger(APP_NAME)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-ALLOWED = os.getenv("ALLOWED_ORIGINS", "https://anthonyklemm.github.io,https://tapedecktimemachine.com,https://www.tapedecktimemachine.com").split(",")
-CACHE_DIR = os.getenv("CACHE_DIR", "/data")  # Correct path for Render Persistent Disks
+ALLOWED = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://anthonyklemm.github.io,https://tapedecktimemachine.com,https://www.tapedecktimemachine.com",
+).split(",")
+CACHE_DIR = os.getenv("CACHE_DIR", "/data")  # Render persistent disk path
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
 
@@ -65,7 +68,7 @@ class SimReq(BaseModel):
     station: Optional[str] = None
     hours: float = 3.0
     repeat_gap_min: int = Field(90, ge=0)
-    seed: Optional[str] = None
+    seed: str = "97"
     limit: int = Field(40, ge=1, le=1000)
 
 class Track(BaseModel):
@@ -81,16 +84,6 @@ class AppleCreateRequest(BaseModel):
     name: str
     tracks: List[Track]
 
-class PlaylistAttributes(BaseModel):
-    url: Optional[str] = None
-
-class PlaylistData(BaseModel):
-    id: str
-    attributes: Optional[PlaylistAttributes] = None
-
-class PlaylistResponse(BaseModel):
-    data: List[PlaylistData]
-
 # -------------------- FastAPI App + CORS --------------------
 app = FastAPI(title="TapeDeck API", version="1.2")
 
@@ -105,34 +98,83 @@ app.add_middleware(
 
 # -------------------- Utils --------------------
 def _norm_key(artist: str, title: str) -> str:
-    def clean(s: str) -> str: s = s.lower(); s = re.sub(r"[^\w\s]", " ", s); s = re.sub(r"\s+", " ", s).strip(); return s
+    def clean(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
     return f"{clean(artist)} :: {clean(title)}"
-def _db() -> sqlite3.Connection: conn = sqlite3.connect(CACHE_DB); conn.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, video_id TEXT, ts INTEGER)"); return conn
-def _cache_get(conn: sqlite3.Connection, k: str) -> Optional[str]: cur = conn.execute("SELECT video_id FROM cache WHERE k=?", (k,)); row = cur.fetchone(); return row[0] if row else None
-def _cache_put(conn: sqlite3.Connection, k: str, vid: str) -> None: conn.execute("INSERT OR REPLACE INTO cache (k, video_id, ts) VALUES (?,?,?)", (k, vid, int(time.time()))); conn.commit()
-def _extract_video_id(u: str) -> Optional[str]: m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", u) or re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", u); return m.group(1) if m else None
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(CACHE_DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, video_id TEXT, ts INTEGER)")
+    return conn
+
+def _cache_get(conn: sqlite3.Connection, k: str) -> Optional[str]:
+    cur = conn.execute("SELECT video_id FROM cache WHERE k=?", (k,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def _cache_put(conn: sqlite3.Connection, k: str, vid: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO cache (k, video_id, ts) VALUES (?,?,?)", (k, vid, int(time.time())))
+    conn.commit()
+
+def _extract_video_id(u: str) -> Optional[str]:
+    # keep simple & robust
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", u) or re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", u)
+    return m.group(1) if m else None
 
 def _discogs_find_video_id(artist: str, title: str) -> Optional[str]:
-    if not DISCOGS_TOKEN: return None
+    if not DISCOGS_TOKEN:
+        return None
     q = f"{artist} - {title}"
     try:
-        r = requests.get("https://api.discogs.com/database/search", params={"q": q, "per_page": 1, "page": 1, "token": DISCOGS_TOKEN}, timeout=12)
-        if r.status_code != 200: return None
+        r = requests.get(
+            "https://api.discogs.com/database/search",
+            params={"q": q, "per_page": 1, "page": 1, "token": DISCOGS_TOKEN},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return None
         results = r.json().get("results", [])
-        if not results: return None
+        if not results:
+            return None
+
         res_url = results[0].get("resource_url")
-        if not res_url: return None
-        time.sleep(1);
+        if not res_url:
+            return None
+
+        time.sleep(1)  # be nice
         d = requests.get(res_url, timeout=12)
-        if d.status_code != 200: return None
+        if d.status_code != 200:
+            return None
+
         for v in d.json().get("videos", []) or []:
             uri = v.get("uri") or ""
-            if "youtube.com" in uri:
+            if "youtube.com" in uri or "youtu.be" in uri:
                 vid = _extract_video_id(uri)
-                if vid: return vid
+                if vid:
+                    return vid
     except Exception as e:
         log.warning("Discogs lookup failed for %s — %s", q, e)
     return None
+
+def _require_apple_keys():
+    if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
+        raise RuntimeError("Apple keys not configured")
+
+def _mint_dev_token(ttl_seconds: int = 55 * 60) -> str:
+    """Create a short-lived Apple developer token."""
+    _require_apple_keys()
+    now = int(time.time())
+    payload = {"iss": APPLE_TEAM_ID, "iat": now, "exp": now + ttl_seconds}
+    token = jwt.encode(
+        payload,
+        APPLE_PRIVATE_KEY,
+        algorithm="ES256",
+        headers={"kid": APPLE_KEY_ID},
+    )
+    return token
 
 # -------------------- Endpoints --------------------
 @app.get("/health")
@@ -147,149 +189,164 @@ def simulate(req: SimReq):
         chart_date = nearest_billboard_chart_date(d)
         entries = fetch_chart_entries_strict(slugs, chart_date, limit=req.limit, tolerance_days=7)
         start_dt = d.replace(hour=6, minute=0, second=0, microsecond=0)
-        seed_val = 97
-        if req.seed is not None:
-            try: seed_val = int(req.seed)
-            except ValueError: log.warning(f"Invalid seed value '{req.seed}', using default 97.")
         spins = simulate_rotations(
-            entries=entries, start_time=start_dt, hours=req.hours,
-            average_song_minutes=3.5, min_gap_minutes=req.repeat_gap_min,
-            seed=seed_val,
+            entries=entries,
+            start_time=start_dt,
+            hours=req.hours,
+            average_song_minutes=3.5,
+            min_gap_minutes=req.repeat_gap_min,
+            seed=int(req.seed or "97"),
         )
-        return {"tracks": [{"timestamp": s.timestamp.isoformat(timespec="minutes"), "artist": s.artist, "title": s.title, "source_rank": s.source_rank} for s in spins],}
+        return {
+            "tracks": [
+                {
+                    "timestamp": s.timestamp.isoformat(timespec="minutes"),
+                    "artist": s.artist,
+                    "title": s.title,
+                    "source_rank": s.source_rank,
+                }
+                for s in spins
+            ],
+        }
     except Exception as e:
         log.exception("simulate failed")
         return JSONResponse(status_code=500, content={"detail": f"simulate failed: {e}"})
 
 @app.post("/v1/yt/resolve")
 def yt_resolve(req: ResolveReq):
-    conn = None
     try:
-        conn = _db(); ids, dropped, seen = [], [], set()
+        conn = _db()
+        ids, seen = [], set()
         for t in req.tracks:
-            if len(ids) >= (req.limit or 50): break
-            k = _norm_key(t.artist, t.title);
+            if len(ids) >= (req.limit or 50):
+                break
+            k = _norm_key(t.artist, t.title)
             vid = _cache_get(conn, k)
-            # --- CORRECTED Syntax: Moved logic to separate lines ---
             if not vid:
-                time.sleep(0.5)
+                time.sleep(0.5)  # Pace requests
                 vid = _discogs_find_video_id(t.artist, t.title)
                 if vid:
                     _cache_put(conn, k, vid)
-            # --- END CORRECTION ---
             if vid and vid not in seen:
-                seen.add(vid);
+                seen.add(vid)
                 ids.append(vid)
         return {"ids": ids}
     except Exception as e:
-        log.exception("yt/resolve failed");
+        log.exception("yt/resolve failed")
         return JSONResponse(status_code=500, content={"detail": f"yt/resolve failed: {e}"})
-    finally:
-        if conn: conn.close()
 
+# ---------- Apple: developer token ----------
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
     try:
-        if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
-            log.error("CRITICAL: Apple keys not configured. TEAM_ID, KEY_ID, or PRIVATE_KEY is missing or empty after processing.")
-            return JSONResponse(status_code=500, content={"detail": "Apple keys not configured"})
-        now = int(time.time())
-        payload = {"iss": APPLE_TEAM_ID, "iat": now, "exp": now + (60 * 55)}
-        token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID})
+        token = _mint_dev_token()
         log.info(f"Successfully generated a dev token. Length: {len(token)}")
         return {"token": token, "storefront": APPLE_STOREFRONT}
     except Exception as e:
-        log.exception(f"CRITICAL: dev-token failed during jwt.encode(). Error: {e}")
+        log.exception("dev-token failed")
         return JSONResponse(status_code=500, content={"detail": f"dev-token failed: {e}"})
 
+# ---------- Apple: create library playlist, then add found songs ----------
 @app.post("/v1/apple/create-playlist")
-def apple_create_playlist(req: AppleCreateRequest) -> Dict[str, any]:
-    if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
-        log.error("Apple keys not configured during playlist creation.")
-        return JSONResponse(status_code=500, content={"detail": "Apple keys not configured"})
-
-    # --- Generate Dev Token ---
+def apple_create_playlist(req: AppleCreateRequest):
     try:
-        now = int(time.time())
-        dev_token = jwt.encode({"iss": APPLE_TEAM_ID, "iat": now, "exp": now + 1500},
-                               APPLE_PRIVATE_KEY, algorithm="ES256",
-                               headers={"kid": APPLE_KEY_ID})
+        dev_token = _mint_dev_token(ttl_seconds=25 * 60)
     except Exception as e:
-        log.exception("Dev token generation failed in create-playlist")
         return JSONResponse(status_code=500, content={"detail": f"Dev token generation failed: {e}"})
 
-    headers = {"Authorization": f"Bearer {dev_token}", "Music-User-Token": req.userToken}
-    storefront = APPLE_STOREFRONT or "us"
+    headers = {
+        "Authorization": f"Bearer {dev_token}",
+        "Music-User-Token": req.userToken,
+    }
 
-    # --- Create Playlist ---
-    playlist_id: Optional[str] = None
-    playlist_url: Optional[str] = None
+    # 1) Create empty library playlist
     try:
-        playlist_payload = {
-            "attributes": { "name": req.name, "description": "Generated by TapeDeck Time Machine" }
-        }
-        log.info(f"Creating playlist '{req.name}'...")
-        r_create = requests.post("https://api.music.apple.com/v1/me/library/playlists",
-                                 headers=headers, json=playlist_payload, timeout=20)
+        payload = {"attributes": {"name": req.name, "description": "Generated by TapeDeck Time Machine"}}
+        r_create = requests.post(
+            "https://api.music.apple.com/v1/me/library/playlists",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
         r_create.raise_for_status()
-        created_data = r_create.json()
-        playlist_response = PlaylistResponse(**created_data)
-        if playlist_response.data and playlist_response.data[0]:
-            playlist_id = playlist_response.data[0].id
-            if playlist_response.data[0].attributes: playlist_url = playlist_response.data[0].attributes.url
-            log.info(f"Playlist created successfully. ID: {playlist_id}, URL: {playlist_url}")
-        else: log.error("Playlist created, but response parsing failed."); raise ValueError("Playlist created, bad response.")
-    except requests.exceptions.RequestException as e:
-        status_code = e.response.status_code if e.response is not None else 500
-        error_detail = f"Playlist creation request failed: {e}"; try:
-            if e.response is not None: error_detail = e.response.json().get('errors', [{}])[0].get('detail', str(e))
-        except Exception: pass
-        log.exception("Failed to create AM playlist (RequestException)"); return JSONResponse(status_code=status_code, content={"detail": error_detail})
+        playlist_id = r_create.json()["data"][0]["id"]  # library IDs look like "p.xxxxx"
     except Exception as e:
-        log.exception("Failed to create AM playlist (Other Exception)"); return JSONResponse(status_code=500, content={"detail": f"Playlist creation failed: {e}"})
+        log.exception("Failed to create AM playlist")
+        return JSONResponse(status_code=500, content={"detail": f"Playlist creation failed: {e}"})
 
-    if not playlist_id: log.error("Playlist creation ok but no ID extracted."); return JSONResponse(status_code=500, content={"detail": "Playlist created, failed ID retrieval."})
-
-    # --- Add Tracks ---
-    song_ids_to_add = []
-    log.info(f"Searching for {len(req.tracks)} tracks to add...")
-    search_headers = {"Authorization": f"Bearer {dev_token}"}
+    # 2) Resolve songs (simple 1-by-1 search)
+    song_ids = []
+    storefront = APPLE_STOREFRONT or "us"
     for track in req.tracks[:100]:
         try:
             params = {"term": f"{track.artist} {track.title}", "limit": 1, "types": "songs"}
-            r_search = requests.get(f"https://api.music.apple.com/v1/catalog/{storefront}/search", headers=search_headers, params=params, timeout=10)
-            r_search.raise_for_status()
-            results = r_search.json().get("results", {}).get("songs", {}).get("data", [])
-            if results: song_ids_to_add.append({"id": results[0]["id"], "type": "songs"})
-            else: log.warning(f"Could not find track: '{track.artist} - {track.title}'")
-        except Exception as e: log.warning(f"Search failed for track '{track.artist} - {track.title}': {e}")
-        time.sleep(0.15)
+            r_search = requests.get(
+                f"https://api.music.apple.com/v1/catalog/{storefront}/search",
+                headers=headers,
+                params=params,
+                timeout=12,
+            )
+            if r_search.status_code == 200:
+                results = r_search.json().get("results", {}).get("songs", {}).get("data", [])
+                if results:
+                    song_ids.append({"id": results[0]["id"], "type": "songs"})
+        except Exception:
+            log.warning("Could not find track '%s - %s'", track.artist, track.title)
+        time.sleep(0.18)
 
-    added_count = 0
-    if not song_ids_to_add:
-        log.warning("No tracks found to add.")
-        return { "detail": "Playlist created, but no tracks matched.", "added_count": 0, "total_tracks_searched": len(req.tracks), "playlist_id": playlist_id, "playlist_url": playlist_url, "storefront": storefront }
+    # 3) Add to playlist (ok if empty)
+    added = 0
+    if song_ids:
+        try:
+            r_add = requests.post(
+                f"https://api.music.apple.com/v1/me/library/playlists/{playlist_id}/tracks",
+                headers=headers,
+                json={"data": song_ids},
+                timeout=20,
+            )
+            r_add.raise_for_status()
+            added = len(song_ids)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"detail": f"Adding tracks failed: {e}"})
 
+    # Library playlists usually do NOT have public URLs
+    return {
+        "added_count": added,
+        "total_tracks": len(req.tracks),
+        "playlist_id": playlist_id,
+        "id": playlist_id,
+        "storefront": storefront,
+        "url": None,  # no public URL for library playlists; frontend will fall back correctly
+    }
+
+# ---------- Apple: song meta for a given song id (used by the mini-player title) ----------
+@app.get("/v1/apple/song-meta")
+def apple_song_meta(id: str = Query(..., description="Apple song id (catalog)"), storefront: str = Query("us")):
+    """
+    Returns minimal metadata for a catalog song id so the web app can show
+    title/artist even when MusicKit's nowPlayingItem is sparse.
+    Response: { id, name, artistName, url }
+    """
     try:
-        log.info(f"Adding {len(song_ids_to_add)} tracks to playlist {playlist_id}...")
-        add_payload = {"data": song_ids_to_add}
-        r_add = requests.post(f"https://api.music.apple.com/v1/me/library/playlists/{playlist_id}/tracks", headers=headers, json=add_payload, timeout=30)
-        r_add.raise_for_status()
-        added_count = len(song_ids_to_add)
-        log.info("Tracks added successfully.")
-    except requests.exceptions.RequestException as e:
-        status_code = e.response.status_code if e.response is not None else 500
-        error_detail = f"Adding tracks failed: {e}"; try:
-            if e.response is not None: error_detail = e.response.json().get('errors', [{}])[0].get('detail', str(e))
-        except Exception: pass
-        log.exception("Failed to add tracks (RequestException)"); return JSONResponse(status_code=status_code, content={ "detail": f"Playlist created, adding tracks failed: {error_detail}", "added_count": 0, "total_tracks_searched": len(req.tracks), "playlist_id": playlist_id, "playlist_url": playlist_url, "storefront": storefront })
+        dev_token = _mint_dev_token(ttl_seconds=10 * 60)
+        url = f"https://api.music.apple.com/v1/catalog/{storefront}/songs/{id}"
+        r = requests.get(url, headers={"Authorization": f"Bearer {dev_token}"}, timeout=12)
+        if r.status_code != 200:
+            return JSONResponse(status_code=r.status_code, content={"detail": f"Apple catalog error: {r.text}"})
+        data = r.json().get("data", [])
+        if not data:
+            return JSONResponse(status_code=404, content={"detail": "Song not found"})
+        attrs = data[0].get("attributes", {}) or {}
+        return {
+            "id": id,
+            "name": attrs.get("name"),
+            "artistName": attrs.get("artistName"),
+            "url": attrs.get("url"),
+        }
     except Exception as e:
-        log.exception("Failed to add tracks (Other Exception)"); return JSONResponse(status_code=500, content={ "detail": f"Playlist created, adding tracks failed: {e}", "added_count": 0, "total_tracks_searched": len(req.tracks), "playlist_id": playlist_id, "playlist_url": playlist_url, "storefront": storefront })
-
-    # --- Return Success ---
-    return { "added_count": added_count, "total_tracks_searched": len(req.tracks), "playlist_id": playlist_id, "playlist_url": playlist_url, "storefront": storefront }
+        log.exception("song-meta failed")
+        return JSONResponse(status_code=500, content={"detail": f"song-meta failed: {e}"})
 
 @app.get("/")
 def root():
     return PlainTextResponse(f"{APP_NAME} OK")
-
