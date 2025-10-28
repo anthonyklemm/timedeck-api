@@ -17,7 +17,7 @@ import jwt  # PyJWT
 
 from fastapi import FastAPI, Query, HTTPException, Cookie  # NEW: Cookie
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 # --- Import simulator bits ---
@@ -44,7 +44,8 @@ CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tapedecktimemachine.com/app.html")
 
 # --- Session / Cookies (NEW) ---
-SESSION_COOKIE_NAME = "td_session"
+SESSION_COOKIE_NAME = "td_session"  # legacy cookie (SameSite=None)
+PARTITIONED_COOKIE_NAME = "__Host-tdsid"  # CHIPS cookie (Partitioned)
 SESS_DB = os.path.join(CACHE_DIR, "sessions.sqlite")
 
 # --- YouTube/Discogs Config ---
@@ -122,7 +123,7 @@ class SpotifyCreateRequest(BaseModel):
 
 
 # -------------------- FastAPI App + CORS --------------------
-app = FastAPI(title="TapeDeck API", version="1.4")
+app = FastAPI(title="TapeDeck API", version="1.5")
 
 log.info(f"Allowed CORS origins: {ALLOWED}")
 app.add_middleware(
@@ -220,7 +221,8 @@ def _discogs_find_video_id(artist: str, title: str) -> Optional[str]:
 def _sess_db() -> sqlite3.Connection:
     conn = sqlite3.connect(SESS_DB)
     conn.execute("PRAGMA busy_timeout = 5000;")
-    conn.execute("""
+    conn.execute(
+        """
       CREATE TABLE IF NOT EXISTS spotify_sessions (
         session_id   TEXT PRIMARY KEY,
         refresh_token TEXT NOT NULL,
@@ -230,13 +232,16 @@ def _sess_db() -> sqlite3.Connection:
         scope         TEXT,
         created_at    INTEGER
       )
-    """)
-    conn.execute("""
+    """
+    )
+    conn.execute(
+        """
       CREATE TABLE IF NOT EXISTS oauth_state (
         state TEXT PRIMARY KEY,
         created_at INTEGER
       )
-    """)
+    """
+    )
     return conn
 
 def _save_oauth_state(state: str):
@@ -276,6 +281,11 @@ def _update_session_tokens(session_id: str, access_token: str, expires_in: int):
     conn.execute("UPDATE spotify_sessions SET access_token=?, expires_at=? WHERE session_id=?",
                  (access_token, int(time.time()) + int(expires_in or 3600), session_id))
     conn.commit(); conn.close()
+
+
+def _choose_cookie(td_session: Optional[str], tdsid: Optional[str]) -> Optional[str]:
+    """Prefer partitioned cookie if present, else legacy cookie."""
+    return tdsid or td_session
 
 
 # --- Apple Music Utils ---
@@ -586,7 +596,7 @@ def apple_song_meta(id: str = Query(..., description="Apple song id (catalog)"),
         raise HTTPException(status_code=500, detail=f"song-meta failed: {e}")
 
 
-# ---------- Spotify Endpoints (NEW session flow) ----------
+# ---------- Spotify Endpoints (session + CHIPS) ----------
 @app.get("/v1/spotify/login")
 async def spotify_login():
     if not SPOTIFY_CLIENT_ID:
@@ -638,18 +648,26 @@ async def spotify_callback(code: Optional[str] = None, error: Optional[str] = No
         uid = _spotify_get_user_id(access_token) or ""
         session_id = _create_session(refresh_token, access_token, expires_in, uid, SPOTIFY_SCOPES)
 
-        # Set secure cookie and redirect back WITHOUT tokens
-        resp = RedirectResponse(f"{FRONTEND_URL}#spotify=ok")
+        # Interstitial page to register a user interaction on API origin
+        resp = RedirectResponse(url="/v1/spotify/ok")
+
+        # 1) Legacy cookie (third-party). Some browsers may delete it; kept for backward-compat.
         resp.set_cookie(
             SESSION_COOKIE_NAME,
             session_id,
             httponly=True,
             secure=True,
-            samesite="none",  # works cross-site; ensure HTTPS
+            samesite="none",
             max_age=30 * 24 * 3600,
             path="/",
         )
-        log.info("Spotify token exchange successful and session cookie set.")
+        # 2) Partitioned cookie (CHIPS) for cross-site reliability.
+        # Starlette doesn't expose Partitioned flag, so set raw header as well.
+        resp.headers.append(
+            "Set-Cookie",
+            f"{PARTITIONED_COOKIE_NAME}={session_id}; Path=/; Secure; HttpOnly; SameSite=None; Partitioned"
+        )
+        log.info("Spotify token exchange successful and session cookies set (legacy + partitioned).")
         return resp
 
     except requests.RequestException as e:
@@ -659,36 +677,69 @@ async def spotify_callback(code: Optional[str] = None, error: Optional[str] = No
         log.exception("Unexpected error during Spotify callback handling.")
         return RedirectResponse(f"{FRONTEND_URL}#spotify_error=internal_server_error")
 
+@app.get("/v1/spotify/ok")
+def spotify_ok():
+    # Simple interstitial that requires a user click, preventing Chrome bounce cleanup
+    html = f"""
+    <!doctype html><meta charset=\"utf-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <body style=\"background:#0a0f17;color:#e5e7eb;font-family:system-ui, -apple-system, Segoe UI, Roboto;display:grid;place-items:center;min-height:100vh;margin:0\">
+      <div style=\"max-width:520px;text-align:center;padding:24px\">
+        <h2 style=\"margin:0 0 8px\">Spotify connected ✅</h2>
+        <p style=\"margin:0 0 16px;color:#a5b4fc\">Your session is ready on this device.</p>
+        <a href=\"{FRONTEND_URL}#spotify=ok\" style=\"display:inline-block;margin-top:8px;padding:10px 16px;border-radius:10px;background:#1f2937;color:#fff;text-decoration:none\">Continue</a>
+      </div>
+    </body>"""
+    return HTMLResponse(html)
+
 @app.get("/v1/spotify/status")
-def spotify_status(td_session: Optional[str] = Cookie(None)):
-    if not td_session:
+def spotify_status(
+    td_session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
+    tdsid: Optional[str] = Cookie(None, alias=PARTITIONED_COOKIE_NAME),
+):
+    sid = _choose_cookie(td_session, tdsid)
+    if not sid:
         return {"signed_in": False}
     try:
-        _access_from_session(td_session)  # will refresh if needed
+        _access_from_session(sid)  # will refresh if needed
         return {"signed_in": True}
     except HTTPException:
         return {"signed_in": False}
 
 @app.post("/v1/spotify/logout")
-def spotify_logout(td_session: Optional[str] = Cookie(None)):
+def spotify_logout(
+    td_session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
+    tdsid: Optional[str] = Cookie(None, alias=PARTITIONED_COOKIE_NAME),
+):
+    sid = _choose_cookie(td_session, tdsid)
     resp = JSONResponse({"ok": True})
+    # Delete both cookies if present
     resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
-    if td_session:
+    # Raw header to clear partitioned cookie
+    resp.headers.append(
+        "Set-Cookie",
+        f"{PARTITIONED_COOKIE_NAME}=deleted; Path=/; Secure; HttpOnly; SameSite=None; Partitioned; Max-Age=0"
+    )
+    if sid:
         conn = _sess_db()
-        conn.execute("DELETE FROM spotify_sessions WHERE session_id=?", (td_session,))
+        conn.execute("DELETE FROM spotify_sessions WHERE session_id=?", (sid,))
         conn.commit(); conn.close()
     return resp
 
 @app.post("/v1/spotify/create-playlist")
-async def spotify_create_playlist(req: SpotifyCreateRequest, td_session: Optional[str] = Cookie(None)):
+async def spotify_create_playlist(
+    req: SpotifyCreateRequest,
+    td_session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
+    tdsid: Optional[str] = Cookie(None, alias=PARTITIONED_COOKIE_NAME),
+):
     """
     Preferred: authenticate via cookie session (auto-refresh).
     Legacy: if body contains accessToken, use that path.
     """
-    if td_session:
-        access_token, user_id = _access_from_session(td_session)
+    sid = _choose_cookie(td_session, tdsid)
+    if sid:
+        access_token, user_id = _access_from_session(sid)
         if not user_id:
-            # if session was created before we stored uid, fetch now
             user_id = _spotify_get_user_id(access_token)
     elif req.accessToken:
         access_token = req.accessToken
