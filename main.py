@@ -6,16 +6,16 @@ import time
 import json
 import sqlite3
 import logging
-import base64  # Added for Spotify auth
-import secrets  # NEW: for state/session ids
+import base64
+import secrets
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime
-from urllib.parse import urlencode  # Added for Spotify auth
+from urllib.parse import urlencode
 
 import requests
 import jwt  # PyJWT
 
-from fastapi import FastAPI, Query, HTTPException, Cookie  # NEW: Cookie
+from fastapi import FastAPI, Query, HTTPException, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -38,15 +38,15 @@ ALLOWED = os.getenv(
     "ALLOWED_ORIGINS",
     "https://anthonyklemm.github.io,https://tapedecktimemachine.com,https://www.tapedecktimemachine.com,http://127.0.0.1:8888,http://localhost:8000",
 ).split(",")
-CACHE_DIR = os.getenv("CACHE_DIR", "/data")  # Render persistent disk path
+CACHE_DIR = os.getenv("CACHE_DIR", "/data")
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_DB = os.path.join(CACHE_DIR, "yt_cache.sqlite")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tapedecktimemachine.com/app.html")
-
-# --- Session / Cookies (NEW) ---
-SESSION_COOKIE_NAME = "td_session"  # legacy cookie (SameSite=None)
-PARTITIONED_COOKIE_NAME = "__Host-tdsid"  # CHIPS cookie (Partitioned)
 SESS_DB = os.path.join(CACHE_DIR, "sessions.sqlite")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tapedecktimemachine.com/app.html").strip()
+
+# --- Cookie names (CHIPS) ---
+SESSION_COOKIE_NAME = "td_session"          # legacy cookie name
+PARTITIONED_COOKIE_NAME = "__Host-tdsid"    # partitioned cookie for CHIPS
 
 # --- YouTube/Discogs Config ---
 DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", "").strip()
@@ -56,7 +56,7 @@ APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID", "").strip()
 APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "").strip()
 APPLE_STOREFRONT = os.getenv("APPLE_STOREFRONT", "us").strip()
 APPLE_PRIVATE_KEY_RAW = os.getenv("APPLE_PRIVATE_KEY", "").strip()
-APPLE_PRIVATE_KEY = None  # Processed below
+APPLE_PRIVATE_KEY = None
 
 # --- Spotify Config ---
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
@@ -65,7 +65,6 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", f"https://{APP_NAME}.on
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1/"
-# Added user-read-email to make /v1/me consistent across accounts
 SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-email"
 
 # --- Process Apple Key ---
@@ -116,25 +115,65 @@ class AppleCreateRequest(BaseModel):
     tracks: List[Track]
 
 class SpotifyCreateRequest(BaseModel):
-    # NOW OPTIONAL (legacy support). Session cookie is preferred.
+    # accessToken optional to allow fallback flows; cookie-session is preferred
     accessToken: Optional[str] = None
     name: str
     tracks: List[Track]
 
 
 # -------------------- FastAPI App + CORS --------------------
-app = FastAPI(title="TapeDeck API", version="1.5")
+app = FastAPI(title="TapeDeck API", version="1.4")
 
 log.info(f"Allowed CORS origins: {ALLOWED}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED if o.strip()],
-    allow_credentials=True,   # important for cookie sessions
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     max_age=600,
 )
 
+# -------------------- DB Helpers (YouTube cache) --------------------
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(CACHE_DB)
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, video_id TEXT, ts INTEGER)")
+    return conn
+
+def _sess_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(SESS_DB)
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    # Sessions: stores refresh/access + expiry
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS spotify_sessions (
+        session_id TEXT PRIMARY KEY,
+        refresh_token TEXT,
+        access_token TEXT,
+        expires_at INTEGER,
+        user_id TEXT,
+        scope TEXT,
+        created_at INTEGER
+      )
+    """)
+    # OAuth state
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS oauth_state (
+        state TEXT PRIMARY KEY,
+        created_at INTEGER
+      )
+    """)
+    # One-time bind tokens
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS bind_tokens (
+        token TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        created_at INTEGER
+      )
+    """)
+    return conn
 
 # -------------------- General Utils --------------------
 def _norm_key(artist: str, title: str) -> str:
@@ -144,13 +183,6 @@ def _norm_key(artist: str, title: str) -> str:
         s = re.sub(r"\s+", " ", s).strip()
         return s
     return f"{clean(artist)} :: {clean(title)}"
-
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(CACHE_DB)
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, video_id TEXT, ts INTEGER)")
-    return conn
 
 def _cache_get(conn: sqlite3.Connection, k: str) -> Optional[str]:
     try:
@@ -216,78 +248,6 @@ def _discogs_find_video_id(artist: str, title: str) -> Optional[str]:
         log.exception(f"Unexpected error in Discogs lookup for '{q}': {e}")
     return None
 
-
-# ---------- Session storage (Spotify) ----------
-def _sess_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(SESS_DB)
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    conn.execute(
-        """
-      CREATE TABLE IF NOT EXISTS spotify_sessions (
-        session_id   TEXT PRIMARY KEY,
-        refresh_token TEXT NOT NULL,
-        access_token  TEXT,
-        expires_at    INTEGER,
-        user_id       TEXT,
-        scope         TEXT,
-        created_at    INTEGER
-      )
-    """
-    )
-    conn.execute(
-        """
-      CREATE TABLE IF NOT EXISTS oauth_state (
-        state TEXT PRIMARY KEY,
-        created_at INTEGER
-      )
-    """
-    )
-    return conn
-
-def _save_oauth_state(state: str):
-    conn = _sess_db()
-    conn.execute("INSERT OR REPLACE INTO oauth_state(state, created_at) VALUES(?, ?)", (state, int(time.time())))
-    conn.commit()
-    conn.close()
-
-def _pop_oauth_state(state: str) -> bool:
-    conn = _sess_db()
-    cur = conn.execute("SELECT state FROM oauth_state WHERE state=?", (state,))
-    ok = cur.fetchone() is not None
-    conn.execute("DELETE FROM oauth_state WHERE state=?", (state,))
-    conn.commit(); conn.close()
-    return ok
-
-def _create_session(refresh_token: str, access_token: str, expires_in: int, user_id: str, scope: str) -> str:
-    session_id = secrets.token_urlsafe(32)
-    expires_at = int(time.time()) + int(expires_in or 3600)
-    conn = _sess_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO spotify_sessions(session_id, refresh_token, access_token, expires_at, user_id, scope, created_at) VALUES(?,?,?,?,?,?,?)",
-        (session_id, refresh_token, access_token, expires_at, user_id, scope, int(time.time()))
-    )
-    conn.commit(); conn.close()
-    return session_id
-
-def _get_session(session_id: str):
-    conn = _sess_db()
-    cur = conn.execute("SELECT refresh_token, access_token, expires_at, user_id, scope FROM spotify_sessions WHERE session_id=?", (session_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row  # (refresh, access, exp, uid, scope) or None
-
-def _update_session_tokens(session_id: str, access_token: str, expires_in: int):
-    conn = _sess_db()
-    conn.execute("UPDATE spotify_sessions SET access_token=?, expires_at=? WHERE session_id=?",
-                 (access_token, int(time.time()) + int(expires_in or 3600), session_id))
-    conn.commit(); conn.close()
-
-
-def _choose_cookie(td_session: Optional[str], tdsid: Optional[str]) -> Optional[str]:
-    """Prefer partitioned cookie if present, else legacy cookie."""
-    return tdsid or td_session
-
-
 # --- Apple Music Utils ---
 def _require_apple_keys():
     if not (APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY):
@@ -300,8 +260,103 @@ def _mint_dev_token(ttl_seconds: int = 55 * 60) -> str:
     token = jwt.encode(payload, APPLE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_KEY_ID})
     return token
 
+# --- Spotify Session Utils ---
+def _save_oauth_state(state: str):
+    conn = _sess_db()
+    conn.execute("INSERT OR REPLACE INTO oauth_state(state, created_at) VALUES(?,?)", (state, int(time.time())))
+    # prune old states (older than 2 hours)
+    conn.execute("DELETE FROM oauth_state WHERE created_at < ?", (int(time.time()) - 2*3600,))
+    conn.commit()
+    conn.close()
 
-# --- Spotify Utils ---
+def _pop_oauth_state(state: str) -> bool:
+    if not state:
+        return False
+    conn = _sess_db()
+    cur = conn.execute("SELECT state FROM oauth_state WHERE state=?", (state,))
+    row = cur.fetchone()
+    if row:
+        conn.execute("DELETE FROM oauth_state WHERE state=?", (state,))
+        conn.commit()
+    conn.close()
+    return bool(row)
+
+def _create_session(refresh_token: str, access_token: str, expires_in: int, user_id: str, scope: str) -> str:
+    session_id = secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + int(expires_in or 3600)
+    conn = _sess_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO spotify_sessions(session_id, refresh_token, access_token, expires_at, user_id, scope, created_at) VALUES(?,?,?,?,?,?,?)",
+        (session_id, refresh_token, access_token, expires_at, user_id, scope, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+    return session_id
+
+def _save_bind_token(token: str, session_id: str) -> None:
+    conn = _sess_db()
+    conn.execute("INSERT OR REPLACE INTO bind_tokens(token, session_id, created_at) VALUES(?,?,?)", (token, session_id, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def _pop_bind_session(token: str) -> Optional[str]:
+    conn = _sess_db()
+    cur = conn.execute("SELECT session_id FROM bind_tokens WHERE token=?", (token,))
+    row = cur.fetchone()
+    if row:
+        conn.execute("DELETE FROM bind_tokens WHERE token=?", (token,))
+        conn.commit()
+    conn.close()
+    return row[0] if row else None
+
+def _choose_cookie(legacy: Optional[str], partitioned: Optional[str]) -> Optional[str]:
+    return partitioned or legacy
+
+def _spotify_refresh_access_token(refresh_token: str) -> Tuple[str, int, Optional[str]]:
+    auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+    headers = {
+        "Authorization": f"Basic {base64.b64encode(auth_string.encode()).decode()}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    payload = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    r = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=payload, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    access_token = j.get("access_token")
+    expires_in = int(j.get("expires_in", 3600))
+    new_refresh = j.get("refresh_token")  # Spotify may or may not return a new one
+    if not access_token:
+        raise HTTPException(status_code=500, detail="spotify_refresh_failed")
+    return access_token, expires_in, new_refresh
+
+def _access_from_session(session_id: str) -> Tuple[str, Optional[str]]:
+    conn = _sess_db()
+    cur = conn.execute("SELECT refresh_token, access_token, expires_at, user_id, scope FROM spotify_sessions WHERE session_id=?", (session_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=401, detail="session_not_found")
+    refresh_token, access_token, expires_at, user_id, scope = row
+    now = int(time.time())
+    if expires_at <= now + 30:
+        # refresh
+        try:
+            new_access, expires_in, new_refresh = _spotify_refresh_access_token(refresh_token)
+            access_token = new_access
+            if new_refresh:
+                refresh_token = new_refresh
+            expires_at = now + expires_in
+            conn.execute("UPDATE spotify_sessions SET access_token=?, refresh_token=?, expires_at=? WHERE session_id=?",
+                         (access_token, refresh_token, expires_at, session_id))
+            conn.commit()
+        except requests.RequestException as e:
+            conn.close()
+            log.error(f"Spotify refresh failed: {e}")
+            raise HTTPException(status_code=401, detail="refresh_failed")
+    conn.close()
+    return access_token, user_id
+
+# --- Spotify API helpers ---
 def _spotify_get_user_id(token: str) -> Optional[str]:
     headers = {"Authorization": f"Bearer {token}"}
     response = None
@@ -380,43 +435,11 @@ def _spotify_add_tracks_to_playlist(token: str, playlist_id: str, track_uris: Li
         time.sleep(0.1)
     return success
 
-def _spotify_refresh(refresh_token: str) -> Dict:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="Spotify integration not configured on server.")
-    auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
-    headers = {
-        "Authorization": f"Basic {base64.b64encode(auth_string.encode()).decode()}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
-    r = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data, timeout=15)
-    try:
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.error(f"Spotify refresh failed: {r.text if r is not None else e}")
-        raise HTTPException(status_code=401, detail="spotify_refresh_failed")
-    return r.json()
-
-def _access_from_session(session_id: str) -> Tuple[str, Optional[str]]:
-    row = _get_session(session_id)
-    if not row:
-        raise HTTPException(status_code=401, detail="no_session")
-    refresh_token, access_token, expires_at, user_id, _scope = row
-    if not access_token or int(time.time()) >= int(expires_at or 0) - 60:
-        t = _spotify_refresh(refresh_token)
-        access_token = t.get("access_token")
-        expires_in = int(t.get("expires_in", 3600))
-        if not access_token:
-            raise HTTPException(status_code=401, detail="spotify_refresh_no_access_token")
-        _update_session_tokens(session_id, access_token, expires_in)
-    return access_token, user_id
-
 
 # -------------------- API Endpoints --------------------
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
-
 
 @app.post("/v1/simulate")
 def simulate_playlist(req: SimReq):
@@ -438,7 +461,6 @@ def simulate_playlist(req: SimReq):
         log.exception("simulate failed")
         raise HTTPException(status_code=500, detail=f"simulate failed: {e}")
 
-
 @app.post("/v1/yt/resolve")
 def yt_resolve(req: ResolveReq):
     conn = None
@@ -457,8 +479,6 @@ def yt_resolve(req: ResolveReq):
                 else: log.warning(f"YT Resolve: Failed via Discogs for '{t.artist} - {t.title}'")
             if vid and vid not in seen:
                 seen.add(vid); ids.append(vid)
-            elif vid in seen:
-                log.debug(f"YT Resolve ({i+1}): Duplicate skipped for '{t.artist} - {t.title}'")
         log.info(f"YouTube resolution finished. Found {len(ids)} unique IDs.")
         return {"ids": ids}
     except Exception as e:
@@ -467,7 +487,6 @@ def yt_resolve(req: ResolveReq):
     finally:
         if conn: conn.close()
 
-
 # ---------- Apple Music Endpoints ----------
 @app.get("/v1/apple/dev-token")
 def apple_dev_token():
@@ -475,8 +494,7 @@ def apple_dev_token():
         token = _mint_dev_token()
         log.info("Generated Apple dev token.")
         return {"token": token, "storefront": APPLE_STOREFRONT}
-    except RuntimeError as e:
-        log.error(f"Apple keys not configured: {e}")
+    except RuntimeError:
         raise HTTPException(status_code=500, detail="Apple Music integration not configured on server.")
     except Exception as e:
         log.exception("apple/dev-token failed")
@@ -493,8 +511,6 @@ def apple_create_playlist(req: AppleCreateRequest):
         raise HTTPException(status_code=500, detail=f"Dev token generation failed: {e}")
 
     headers = {"Authorization": f"Bearer {dev_token}", "Music-User-Token": req.userToken}
-    playlist_id = None
-    playlist_url = None
 
     # 1) Create empty library playlist
     try:
@@ -507,11 +523,7 @@ def apple_create_playlist(req: AppleCreateRequest):
     except requests.RequestException as e:
         status_code = e.response.status_code if e.response is not None else 500
         response_text = e.response.text if e.response is not None else str(e)
-        log.error(f"Failed to create Apple Music playlist: {e} (Status: {status_code}) Response: {response_text}")
         raise HTTPException(status_code=status_code, detail=f"Apple Music playlist creation failed: {response_text}")
-    except Exception as e:
-        log.exception("Unexpected error creating Apple Music playlist")
-        raise HTTPException(status_code=500, detail=f"Playlist creation failed: {e}")
 
     # 2) Resolve songs
     song_ids_to_add = []
@@ -522,12 +534,10 @@ def apple_create_playlist(req: AppleCreateRequest):
             params = {"term": f"{track.artist} {track.title}", "limit": 1, "types": "songs"}
             search_url = f"https://api.music.apple.com/v1/catalog/{storefront}/search"
             r_search = requests.get(search_url, headers=headers, params=params, timeout=12)
-
             if r_search.status_code == 429:
                 log.warning("Apple Music API rate limit hit during search. Skipping remaining tracks.")
                 break
             r_search.raise_for_status()
-
             results = r_search.json().get("results", {}).get("songs", {}).get("data", [])
             if results:
                 song_id = results[0]["id"]
@@ -550,18 +560,13 @@ def apple_create_playlist(req: AppleCreateRequest):
             add_url = f"https://api.music.apple.com/v1/me/library/playlists/{playlist_id}/tracks"
             r_add = requests.post(add_url, headers=headers, json={"data": song_ids_to_add}, timeout=30)
             r_add.raise_for_status()
-            if r_add.status_code == 204:
-                added_count = len(song_ids_to_add)
-                log.info(f"Successfully added {added_count} tracks to Apple Music playlist {playlist_id}.")
-            else:
-                log.warning(f"Adding tracks to Apple Music playlist {playlist_id} returned status {r_add.status_code}, expected 204.")
-                added_count = len(song_ids_to_add)
+            added_count = len(song_ids_to_add)
         except requests.RequestException as e:
             status_code = e.response.status_code if e.response is not None else 500
             response_text = e.response.text if e.response is not None else str(e)
             log.error(f"Failed to add tracks to Apple Music playlist {playlist_id}: {e} (Status: {status_code}) Response: {response_text}")
             added_count = 0
-        except Exception as e:
+        except Exception:
             log.exception(f"Unexpected error adding tracks to Apple Music playlist {playlist_id}")
             added_count = 0
     else:
@@ -573,36 +578,15 @@ def apple_create_playlist(req: AppleCreateRequest):
         "playlist_id": playlist_id,
         "id": playlist_id,
         "storefront": storefront,
-        "url": playlist_url,
+        "url": None,
     }
 
-@app.get("/v1/apple/song-meta")
-def apple_song_meta(id: str = Query(..., description="Apple song id (catalog)"), storefront: str = Query("us")):
-    try:
-        dev_token = _mint_dev_token(ttl_seconds=10 * 60)
-        url = f"https://api.music.apple.com/v1/catalog/{storefront}/songs/{id}"
-        r = requests.get(url, headers={"Authorization": f"Bearer {dev_token}"}, timeout=12)
-        if r.status_code != 200:
-            log.warning(f"Apple song-meta request failed for ID {id}: Status {r.status_code} - {r.text}")
-            raise HTTPException(status_code=r.status_code, detail=f"Apple catalog error: {r.text}")
-        data = r.json().get("data", [])
-        if not data:
-            log.warning(f"Apple song-meta: Song ID {id} not found in storefront {storefront}")
-            raise HTTPException(status_code=404, detail="Song not found")
-        attrs = data[0].get("attributes", {}) or {}
-        return {"id": id, "name": attrs.get("name"), "artistName": attrs.get("artistName"), "url": attrs.get("url")}
-    except Exception as e:
-        log.exception(f"apple/song-meta failed for ID {id}")
-        raise HTTPException(status_code=500, detail=f"song-meta failed: {e}")
-
-
-# ---------- Spotify Endpoints (session + CHIPS) ----------
+# ---------- Spotify Endpoints (session + CHIPS + bind) ----------
 @app.get("/v1/spotify/login")
 async def spotify_login():
     if not SPOTIFY_CLIENT_ID:
-        log.error("Spotify login attempt failed: SPOTIFY_CLIENT_ID not configured.")
         raise HTTPException(status_code=500, detail="Spotify integration not configured on server.")
-    state = secrets.token_urlsafe(16)
+    state = secrets.token_urlsafe(24)
     _save_oauth_state(state)
     auth_params = {
         "client_id": SPOTIFY_CLIENT_ID,
@@ -628,6 +612,7 @@ async def spotify_callback(code: Optional[str] = None, error: Optional[str] = No
     if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
         raise HTTPException(status_code=500, detail="Spotify integration not configured on server.")
 
+    response = None
     try:
         auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
         headers = {"Authorization": f"Basic {base64.b64encode(auth_string.encode()).decode()}",
@@ -640,18 +625,19 @@ async def spotify_callback(code: Optional[str] = None, error: Optional[str] = No
         access_token = token_info.get("access_token")
         refresh_token = token_info.get("refresh_token")
         expires_in = int(token_info.get("expires_in", 3600))
-        if not access_token or not refresh_token:
-            log.error(f"Token exchange missing fields: {token_info}")
+        if not access_token:
+            log.error("Spotify token exchange response did not contain access_token.")
             return RedirectResponse(f"{FRONTEND_URL}#spotify_error=token_exchange_failed")
 
-        # Fetch user id once and create session
         uid = _spotify_get_user_id(access_token) or ""
         session_id = _create_session(refresh_token, access_token, expires_in, uid, SPOTIFY_SCOPES)
 
-        # Interstitial page to register a user interaction on API origin
-        resp = RedirectResponse(url="/v1/spotify/ok")
+        # Create a short-lived bind token so SPA can set cookies under its own partition
+        bind_token = secrets.token_urlsafe(24)
+        _save_bind_token(bind_token, session_id)
 
-        # 1) Legacy cookie (third-party). Some browsers may delete it; kept for backward-compat.
+        resp = RedirectResponse(url=f"/v1/spotify/ok?bind={bind_token}")
+        # Set legacy + partitioned cookies here too
         resp.set_cookie(
             SESSION_COOKIE_NAME,
             session_id,
@@ -661,49 +647,63 @@ async def spotify_callback(code: Optional[str] = None, error: Optional[str] = No
             max_age=30 * 24 * 3600,
             path="/",
         )
-        # 2) Partitioned cookie (CHIPS) for cross-site reliability.
-        # Starlette doesn't expose Partitioned flag, so set raw header as well.
         resp.headers.append(
             "Set-Cookie",
             f"{PARTITIONED_COOKIE_NAME}={session_id}; Path=/; Secure; HttpOnly; SameSite=None; Partitioned"
         )
-        log.info("Spotify token exchange successful and session cookies set (legacy + partitioned).")
+        log.info("Callback: session stored; cookies set; redirecting to interstitial with bind token.")
         return resp
 
     except requests.RequestException as e:
-        log.error(f"Error exchanging Spotify code for tokens: {e}")
+        status_code = response.status_code if response is not None else 500
+        response_text = response.text if response is not None else str(e)
+        log.error(f"Error exchanging Spotify code for tokens: {e} (Status: {status_code}) Response: {response_text}")
         return RedirectResponse(f"{FRONTEND_URL}#spotify_error=token_exchange_failed")
-    except Exception as e:
+    except Exception:
         log.exception("Unexpected error during Spotify callback handling.")
         return RedirectResponse(f"{FRONTEND_URL}#spotify_error=internal_server_error")
 
 @app.get("/v1/spotify/ok")
-def spotify_ok():
-    # Simple interstitial that requires a user click, preventing Chrome bounce cleanup
+def spotify_ok(bind: Optional[str] = None):
+    hash_suffix = f"#bind={bind}" if bind else "#spotify=ok"
     html = f"""
-    <!doctype html><meta charset=\"utf-8\">
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-    <body style=\"background:#0a0f17;color:#e5e7eb;font-family:system-ui, -apple-system, Segoe UI, Roboto;display:grid;place-items:center;min-height:100vh;margin:0\">
-      <div style=\"max-width:520px;text-align:center;padding:24px\">
-        <h2 style=\"margin:0 0 8px\">Spotify connected ✅</h2>
-        <p style=\"margin:0 0 16px;color:#a5b4fc\">Your session is ready on this device.</p>
-        <a href=\"{FRONTEND_URL}#spotify=ok\" style=\"display:inline-block;margin-top:8px;padding:10px 16px;border-radius:10px;background:#1f2937;color:#fff;text-decoration:none\">Continue</a>
+    <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <body style="background:#0a0f17;color:#e5e7eb;font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
+      <div style="max-width:520px;text-align:center;padding:24px">
+        <h2 style="margin:0 0 8px">Spotify connected ✅</h2>
+        <p style="margin:0 0 16px;color:#a5b4fc">Your session is ready.</p>
+        <a href="{FRONTEND_URL}{hash_suffix}" style="display:inline-block;margin-top:8px;padding:10px 16px;border-radius:10px;background:#1f2937;color:#fff;text-decoration:none">Continue</a>
       </div>
     </body>"""
     return HTMLResponse(html)
+
+@app.get("/v1/spotify/bind")
+def spotify_bind(token: str):
+    """Bind a session cookie in the partition of the top-level SPA after redirect."""
+    sid = _pop_bind_session(token)
+    if not sid:
+        raise HTTPException(status_code=400, detail="invalid_or_expired_bind_token")
+    resp = JSONResponse({"ok": True})
+    # Set both cookies again, now under the SPA's top-level partition
+    resp.set_cookie(SESSION_COOKIE_NAME, sid, httponly=True, secure=True, samesite="none", max_age=30*24*3600, path="/")
+    resp.headers.append("Set-Cookie", f"{PARTITIONED_COOKIE_NAME}={sid}; Path=/; Secure; HttpOnly; SameSite=None; Partitioned")
+    log.info("Bound session cookies for SPA partition via /v1/spotify/bind")
+    return resp
 
 @app.get("/v1/spotify/status")
 def spotify_status(
     td_session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
     tdsid: Optional[str] = Cookie(None, alias=PARTITIONED_COOKIE_NAME),
 ):
+    log.info(f"/v1/spotify/status cookies => legacy_present={bool(td_session)} partitioned_present={bool(tdsid)}")
     sid = _choose_cookie(td_session, tdsid)
     if not sid:
         return {"signed_in": False}
     try:
-        _access_from_session(sid)  # will refresh if needed
+        _access_from_session(sid)
         return {"signed_in": True}
-    except HTTPException:
+    except HTTPException as e:
+        log.warning(f"/v1/spotify/status session check failed: {e.detail}")
         return {"signed_in": False}
 
 @app.post("/v1/spotify/logout")
@@ -713,9 +713,7 @@ def spotify_logout(
 ):
     sid = _choose_cookie(td_session, tdsid)
     resp = JSONResponse({"ok": True})
-    # Delete both cookies if present
     resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
-    # Raw header to clear partitioned cookie
     resp.headers.append(
         "Set-Cookie",
         f"{PARTITIONED_COOKIE_NAME}=deleted; Path=/; Secure; HttpOnly; SameSite=None; Partitioned; Max-Age=0"
@@ -723,7 +721,8 @@ def spotify_logout(
     if sid:
         conn = _sess_db()
         conn.execute("DELETE FROM spotify_sessions WHERE session_id=?", (sid,))
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
     return resp
 
 @app.post("/v1/spotify/create-playlist")
@@ -732,10 +731,7 @@ async def spotify_create_playlist(
     td_session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
     tdsid: Optional[str] = Cookie(None, alias=PARTITIONED_COOKIE_NAME),
 ):
-    """
-    Preferred: authenticate via cookie session (auto-refresh).
-    Legacy: if body contains accessToken, use that path.
-    """
+    # Prefer cookie-session; fallback to provided accessToken for older clients
     sid = _choose_cookie(td_session, tdsid)
     if sid:
         access_token, user_id = _access_from_session(sid)
@@ -751,14 +747,12 @@ async def spotify_create_playlist(
     tracks_to_resolve = req.tracks
     log.info(f"Received request to create Spotify playlist '{playlist_name}' with {len(tracks_to_resolve)} tracks.")
 
-    # 2. Create the empty playlist
     playlist_info = _spotify_create_playlist(access_token, user_id, playlist_name, description="Generated by TapeDeckTimeMachine")
     if not playlist_info or not playlist_info.get("id"):
         raise HTTPException(status_code=500, detail="Failed to create Spotify playlist.")
     playlist_id = playlist_info["id"]
     playlist_url = playlist_info.get("url")
 
-    # 3. Search for track URIs
     log.info(f"Searching Spotify for {len(tracks_to_resolve)} tracks...")
     track_uris_to_add: List[str] = []
     failed_searches = 0
@@ -768,14 +762,10 @@ async def spotify_create_playlist(
             track_uris_to_add.append(uri)
         else:
             failed_searches += 1
-        if (i + 1) % 10 == 0:
-            time.sleep(0.1)
-        elif (i + 1) % 50 == 0:
-            time.sleep(0.5)
+        if (i + 1) % 10 == 0: time.sleep(0.1)
+        elif (i + 1) % 50 == 0: time.sleep(0.5)
 
     log.info(f"Spotify search complete. Found {len(track_uris_to_add)} URIs. Failed to find {failed_searches} tracks.")
-
-    # 4. Add found tracks
     add_success = _spotify_add_tracks_to_playlist(access_token, playlist_id, track_uris_to_add)
     if not add_success:
         log.warning(f"Failed to add some or all tracks to Spotify playlist {playlist_id}.")
@@ -787,7 +777,6 @@ async def spotify_create_playlist(
         "url": playlist_url,
         "add_success": add_success
     }
-
 
 # ---------- Root Endpoint ----------
 @app.get("/")
