@@ -65,7 +65,7 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", f"https://{APP_NAME}.on
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1/"
-SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-email"
+SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-email user-read-private"
 
 # --- Process Apple Key ---
 log.info("--- Apple Key Diagnostics ---")
