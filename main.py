@@ -28,6 +28,20 @@ from playlist_creator import (
     simulate_rotations,
 )
 
+# --- Import analytics ---
+from analytics import (
+    init_db,
+    EventIn,
+    save_event,
+    get_today_stats,
+    get_top_searches,
+    get_genre_breakdown,
+    get_year_breakdown,
+    get_export_split,
+    get_zero_result_rate,
+    get_recent_activity,
+)
+
 # -------------------- Config / Logging --------------------
 APP_NAME = "timedeck-api"
 log = logging.getLogger(APP_NAME)
@@ -127,6 +141,12 @@ app.add_middleware(
     allow_headers=["*"],
     max_age=600,
 )
+
+# Initialize analytics database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    log.info("Analytics database initialized on startup.")
 
 # -------------------- General Utils --------------------
 def _norm_key(artist: str, title: str) -> str:
@@ -609,3 +629,55 @@ async def spotify_create_playlist(req: SpotifyCreateRequest):
 @app.get("/")
 def root():
     return PlainTextResponse(f"{APP_NAME} OK")
+
+
+# ---------- Analytics Endpoints ----------
+@app.post("/v1/events")
+async def ingest_event(event: EventIn):
+    """Ingest a single analytics event."""
+    success = save_event(event)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to save event")
+    return {"ok": True}
+
+
+@app.get("/v1/analytics/today-stats")
+def analytics_today_stats():
+    """Get today's stats: searches, exports, active users."""
+    return get_today_stats()
+
+
+@app.get("/v1/analytics/top-searches")
+def analytics_top_searches(limit: int = Query(10, ge=1, le=100)):
+    """Get top search queries."""
+    return get_top_searches(limit=limit)
+
+
+@app.get("/v1/analytics/genre-breakdown")
+def analytics_genre_breakdown(limit: int = Query(20, ge=1, le=100)):
+    """Get genre breakdown."""
+    return get_genre_breakdown(limit=limit)
+
+
+@app.get("/v1/analytics/year-breakdown")
+def analytics_year_breakdown(limit: int = Query(20, ge=1, le=100)):
+    """Get year/range breakdown."""
+    return get_year_breakdown(limit=limit)
+
+
+@app.get("/v1/analytics/export-split")
+def analytics_export_split():
+    """Get export provider split."""
+    return get_export_split()
+
+
+@app.get("/v1/analytics/zero-result-rate")
+def analytics_zero_result_rate():
+    """Get zero-result rate."""
+    return get_zero_result_rate()
+
+
+@app.get("/v1/analytics/recent-activity")
+def analytics_recent_activity(limit: int = Query(20, ge=1, le=100)):
+    """Get recent activity feed."""
+    return get_recent_activity(limit=limit)
