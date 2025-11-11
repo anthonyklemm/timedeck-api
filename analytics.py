@@ -5,7 +5,7 @@ import os
 import json
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
 
@@ -66,10 +66,17 @@ def save_event(e: EventIn) -> bool:
     """Save an event to the database."""
     conn = _conn()
     try:
+        # Normalize timestamp: convert to UTC and store as naive datetime string
+        ts = e.ts
+        if ts.tzinfo is not None:
+            # Convert timezone-aware to UTC and remove tzinfo
+            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+        ts_str = ts.isoformat()
+
         conn.execute(
             "INSERT INTO events (ts, event, anon_user_id, session_id, props_json) VALUES (?, ?, ?, ?, ?)",
             (
-                e.ts.isoformat() + "Z" if e.ts.isoformat().endswith("Z") is False else e.ts.isoformat(),
+                ts_str,
                 e.event,
                 e.anon_user_id,
                 e.session_id,
